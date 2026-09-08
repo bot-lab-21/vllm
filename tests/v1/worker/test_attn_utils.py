@@ -7,10 +7,14 @@ while keeping per-block content compact, so padding bytes at the end of each pag
 never addressed by the logical view.
 """
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
@@ -23,14 +27,54 @@ from vllm.v1.kv_cache_interface import (
     compute_layout_strides,
 )
 from vllm.v1.worker.gpu.attn_utils import (
+    build_attn_metadata,
+    compute_mm_prefix_ranges,
     get_attn_cg_support,
     get_query_lens_mismatch_unsupported_backend,
+    init_attn_backend,
+    synchronize_attention_impl_kv_cache_layout,
 )
 from vllm.v1.worker.utils import (
     AttentionGroup,
     allocate_kv_cache,
     copy_kv_cache_blocks_inplace,
 )
+
+
+@pytest.mark.parametrize("offset", range(4))
+def test_mm_prefix_ranges_include_aligned_image_sentinels(offset):
+    is_embed = torch.zeros(384, dtype=torch.bool)
+    is_embed[8:-8] = True
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="image",
+        mm_position=PlaceholderRange(offset=offset, length=384, is_embed=is_embed),
+    )
+    features = {"request": [feature]}
+
+    assert compute_mm_prefix_ranges(["request"], features, sliding_window=128) == {
+        0: []
+    }
+    assert compute_mm_prefix_ranges(
+        ["request"],
+        features,
+        sliding_window=128,
+        clamp_sliding_window=True,
+        span_leading_pad_modulus=4,
+    ) == {0: [(3, offset + 383)]}
+
+
+def test_mm_prefix_ranges_preserve_unaligned_embed_ranges():
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="image",
+        mm_position=PlaceholderRange(offset=7, length=32),
+    )
+    assert compute_mm_prefix_ranges(
+        ["request"], {"request": [feature]}, sliding_window=128
+    ) == {0: [(7, 38)]}
 
 
 class _FakeMetadataBuilder:
@@ -51,6 +95,117 @@ class _DraftBackend:
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         return False
+
+
+class _CachingMetadataBuilder:
+    supports_update_block_table = True
+
+    def __init__(self):
+        self.num_builds = 0
+        self.num_updates = 0
+        self.state = torch.zeros(1, dtype=torch.int32)
+
+    def build(self, common_prefix_len, common_attn_metadata, **_kwargs):
+        self.num_builds += 1
+        self.state.fill_(self.num_builds)
+        return SimpleNamespace(
+            block_table=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            is_prefilling=common_attn_metadata.is_prefilling,
+            state=self.state,
+        )
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        return self.build(0, common_attn_metadata)
+
+    def update_block_table(self, metadata, block_table, slot_mapping):
+        self.num_updates += 1
+        return SimpleNamespace(
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+            reused=metadata,
+            is_prefilling=metadata.is_prefilling,
+            state=metadata.state,
+        )
+
+
+def test_attention_impl_cache_layout_preserves_model_specific_dtype():
+    target_cache_config = SimpleNamespace(
+        cache_dtype="fp8_ds_mla", kv_cache_layout=None
+    )
+    draft_cache_config = SimpleNamespace(cache_dtype="fp8", kv_cache_layout=None)
+    layers = {
+        "target": SimpleNamespace(
+            impl=SimpleNamespace(cache_config=target_cache_config)
+        ),
+        "draft": SimpleNamespace(impl=SimpleNamespace(cache_config=draft_cache_config)),
+    }
+
+    synchronize_attention_impl_kv_cache_layout(layers, "BLHNC")
+
+    assert target_cache_config.kv_cache_layout == "BLHNC"
+    assert draft_cache_config.kv_cache_layout == "BLHNC"
+    assert target_cache_config.cache_dtype == "fp8_ds_mla"
+    assert draft_cache_config.cache_dtype == "fp8"
+
+
+def test_attention_builders_keep_target_and_draft_model_configs(monkeypatch):
+    import vllm.v1.worker.gpu.attn_utils as attn_utils
+
+    class Builder(_FakeMetadataBuilder):
+        requires_block_table_width = False
+
+        def __init__(self, spec, layer_names, config, device):
+            super().__init__(AttentionCGSupport.ALWAYS)
+            self.config = config
+
+    class Backend:
+        @staticmethod
+        def full_cls_name():
+            return (__name__, "Backend")
+
+        @staticmethod
+        def get_supported_kernel_block_sizes():
+            return [16]
+
+        @staticmethod
+        def get_builder_cls():
+            return Builder
+
+    configs = [
+        SimpleNamespace(cache_config=SimpleNamespace(kv_cache_layout=None))
+        for _ in range(2)
+    ]
+    layers = {
+        name: SimpleNamespace(get_attn_backend=lambda: Backend, num_heads=8)
+        for name in ("target", "draft")
+    }
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda _: {})
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda config, layer_type, names: {name: layers[name] for name in names},
+    )
+    spec = FullAttentionSpec(
+        block_size=32, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    cache = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(list(layers), spec)],
+    )
+
+    groups, _, kernel_sizes = init_attn_backend(
+        cache,
+        configs[0],
+        torch.device("cpu"),
+        layer_vllm_configs={"draft": configs[1]},
+    )
+
+    assert kernel_sizes == [16]
+    assert len(groups[0]) == 2
+    for group, expected_config in zip(groups[0], configs):
+        assert group.get_metadata_builder(0).config is expected_config
 
 
 def test_attention_checks_preserve_global_and_target_scoped_support():
@@ -116,6 +271,79 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         )
         == "_DraftBackend"
     )
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_build_attn_metadata_reuses_equivalent_cache_group_builds(for_capture):
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    builders = [_CachingMetadataBuilder(), _CachingMetadataBuilder()]
+    groups = []
+    cache_groups = []
+    for group_id, builder in enumerate(builders):
+        layer_name = f"layer.{group_id}"
+        group = AttentionGroup(
+            _TargetBackend,  # type: ignore[arg-type]
+            [layer_name],
+            spec,
+            group_id,
+        )
+        group.metadata_builders = [builder]  # type: ignore[list-item]
+        groups.append([group])
+        cache_groups.append(KVCacheGroupSpec([layer_name], spec))
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=cache_groups,
+    )
+    block_tables = [
+        torch.full((2, 1), group_id, dtype=torch.int32) for group_id in range(2)
+    ]
+    slot_mappings = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
+    is_prefilling = torch.ones(2, dtype=torch.bool)
+    model_metadata = SimpleNamespace(
+        get_extra_common_attn_kwargs=Mock(
+            side_effect=lambda *_: {"is_prefilling": is_prefilling}
+        ),
+        get_extra_attn_kwargs=Mock(return_value={}),
+    )
+
+    build_kwargs = dict(
+        attn_groups=groups,
+        num_reqs=2,
+        num_tokens=2,
+        query_start_loc_gpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+        max_seq_len=1,
+        block_tables=block_tables,
+        slot_mappings=slot_mappings,
+        kv_cache_config=kv_cache_config,
+        model_specific_attn_metadata=model_metadata,
+    )
+    metadata = build_attn_metadata(**build_kwargs, for_cudagraph_capture=for_capture)
+
+    assert [builder.num_builds for builder in builders] == [1, 0]
+    assert [builder.num_updates for builder in builders] == [0, 1]
+    assert model_metadata.get_extra_common_attn_kwargs.call_count == 1
+    assert metadata["layer.0"].block_table is block_tables[0]
+    assert metadata["layer.1"].block_table is block_tables[1]
+    for group_id in range(2):
+        torch.testing.assert_close(
+            metadata[f"layer.{group_id}"].slot_mapping, slot_mappings[group_id]
+        )
+    assert metadata["layer.1"].reused is metadata["layer.0"]
+    assert all(item.is_prefilling is is_prefilling for item in metadata.values())
+    captured_state = metadata["layer.1"].state
+    runtime = build_attn_metadata(**build_kwargs)
+    assert captured_state.data_ptr() == runtime["layer.1"].state.data_ptr()
+    assert captured_state.item() == 2
 
 
 def test_reshape_padded_kv_cache_strides_by_padded_page():

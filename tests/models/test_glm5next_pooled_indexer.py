@@ -1,0 +1,1252 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import math
+import os
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from vllm.models.deepseek_v4.nvidia.b12x_indexer import _flatten_index_cache
+from vllm.models.glm5next.nvidia.ops.glm_kpool import (
+    expand_c4_block_table,
+    expand_pool_ids,
+    gather_c4_block_table_rows,
+    pool_seq_lens,
+    prepare_c4_decode_metadata,
+    update_decode_pools,
+)
+from vllm.models.glm5next.nvidia.pooled_indexer import Glm5NextPooledIndexer
+from vllm.platforms import current_platform
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+    B12xGLM5NextMLASparseMetadataBuilder,
+    B12xMLASparseMetadata,
+)
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+def _require_glm_gpu() -> torch.device:
+    if os.environ.get("B12X_GLM53_GPU_TEST") != "1":
+        pytest.skip("set B12X_GLM53_GPU_TEST=1 to run GLM-5.3 GPU tests")
+    if not torch.accelerator.is_available():
+        pytest.skip("GLM-5.3 GPU tests require CUDA")
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    if current_platform.get_device_capability(device.index or 0) not in (
+        (12, 0),
+        (12, 1),
+    ):
+        pytest.skip("GLM-5.3 GPU tests require SM120 or SM121")
+    return device
+
+
+def _hadamard128(x: torch.Tensor) -> torch.Tensor:
+    for stride in (1, 2, 4, 8, 16, 32, 64):
+        x = x.reshape(-1, 2, stride)
+        a, b = x[:, 0], x[:, 1]
+        x = torch.stack((a + b, a - b), dim=1).reshape(128)
+    return x / (128**0.5)
+
+
+@pytest.mark.parametrize("mixed_prefill", [False, True])
+@pytest.mark.parametrize("dcp_size,dcp_rank", [(1, 0), (4, 0), (4, 3)])
+def test_glm53_adaptive_sparse_metadata_replays_device_boundaries(
+    mixed_prefill, dcp_size, dcp_rank
+) -> None:
+    device = _require_glm_gpu()
+    builder = object.__new__(B12xGLM5NextMLASparseMetadataBuilder)
+    builder.use_pcp = False
+    builder.reorder_batch_threshold = 128
+    builder._prefill_backend = None
+    builder.topk_tokens = 2048
+    builder.cp_kv_cache_interleave_size = 4
+    builder.kv_cache_spec = SimpleNamespace(block_size=256)
+    builder.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    builder.requires_glm_next_selector_metadata = True
+    builder._ckv_gather_requested = False
+    builder.dcp_world_size = dcp_size
+    builder.dcp_rank = dcp_rank
+    builder._max_speculative_decode_query_len = 8
+    builder.req_id_per_token_buffer = torch.empty(12, dtype=torch.int32, device=device)
+    builder.cache_seq_lens_per_token_buffer = torch.empty_like(
+        builder.req_id_per_token_buffer
+    )
+    builder._capture_default_state_slot_ids = torch.arange(
+        4, dtype=torch.int32, device=device
+    )
+    builder._capture_state_slot_ids = torch.empty(4, dtype=torch.int32, device=device)
+    builder._capture_state_is_fresh = torch.empty(4, dtype=torch.bool, device=device)
+    builder._capture_num_accepted_tokens = torch.empty_like(
+        builder._capture_state_slot_ids
+    )
+    builder._capture_is_prefilling = torch.empty_like(builder._capture_state_is_fresh)
+    common = SimpleNamespace(
+        num_reqs=4,
+        num_actual_tokens=12,
+        max_query_len=8,
+        max_seq_len=1024,
+        query_start_loc=torch.tensor(
+            [0, 4, 8, 12, 12], dtype=torch.int32, device=device
+        ),
+        query_start_loc_cpu=torch.tensor([0, 4, 8, 12, 12], dtype=torch.int32),
+        seq_lens=torch.tensor([264, 524, 784, 0], dtype=torch.int32, device=device),
+        seq_lens_cpu_upper_bound=torch.tensor([268, 528, 784, 0], dtype=torch.int32),
+        block_table_tensor=torch.tensor(
+            [[5], [7], [9], [0]], dtype=torch.int32, device=device
+        ),
+        slot_mapping=torch.full((12,), -1, dtype=torch.int64, device=device),
+        dcp_local_seq_lens=None,
+        positions=None,
+        is_prefilling=torch.tensor([False, False, mixed_prefill, False]),
+    )
+    captured = builder.build_for_cudagraph_capture(common)
+    observed_ids = torch.empty_like(captured.req_id_per_token)
+    observed_lens = torch.empty_like(captured.cache_seq_lens_per_token)
+    if dcp_size == 1:
+        from b12x.attention import sparse_mla
+
+        from vllm.v1.attention.backends.mla.sparse_utils import (
+            triton_convert_req_index_to_global_index,
+        )
+
+        cache = torch.empty((10, 256, 528), dtype=torch.uint8, device=device)
+        sparse_mla.concat_and_cache_glm_next_mla_fp8(
+            torch.randn((2560, 512), dtype=torch.bfloat16, device=device),
+            cache,
+            torch.arange(2560, dtype=torch.int64, device=device),
+        )
+        query = torch.randn((12, 16, 512), dtype=torch.bfloat16, device=device)
+        indices = torch.full((12, 2051), -1, dtype=torch.int32, device=device)
+        indices[:, :4] = torch.arange(4, dtype=torch.int32, device=device)
+        plan = sparse_mla.plan(
+            sparse_mla.Caps(
+                device=device,
+                num_q_heads=16,
+                max_q_rows=12,
+                max_width=2051,
+                softmax_scale=256**-0.5,
+                kv_dtype=torch.uint8,
+                head_dim=512,
+                v_head_dim=512,
+                model_type=int(sparse_mla.ModelType.GLM_NEXT),
+                mode="extend" if mixed_prefill else "decode",
+                max_batch=12,
+                page_size=256,
+            )
+        )
+        scratch = torch.empty(plan.layout.nbytes, dtype=torch.uint8, device=device)
+
+        def attention(request_ids, lengths):
+            physical, counts = triton_convert_req_index_to_global_index(
+                request_ids,
+                common.block_table_tensor,
+                indices,
+                BLOCK_SIZE=256,
+                NUM_TOPK_TOKENS=2051,
+                return_valid_counts=True,
+            )
+            return sparse_mla.run(
+                sparse_mla.bind(
+                    plan,
+                    scratch=scratch,
+                    q=query,
+                    kv_cache=cache,
+                    selected_indices=physical,
+                    cache_lengths=lengths,
+                    selected_lengths=counts,
+                )
+            )
+
+        observed_attention = attention(
+            captured.req_id_per_token, captured.cache_seq_lens_per_token
+        ).clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        observed_ids.copy_(captured.req_id_per_token)
+        observed_lens.copy_(captured.cache_seq_lens_per_token)
+        if dcp_size == 1:
+            observed_attention.copy_(
+                attention(captured.req_id_per_token, captured.cache_seq_lens_per_token)
+            )
+    query_splits = [[1, 7, 4, 0], [7, 1, 4, 0]]
+    if not mixed_prefill:
+        query_splits += [[4, 1, 7, 0], [1, 1, 1, 0]]
+    for query_lens in query_splits:
+        starts = torch.tensor(
+            [0, *torch.tensor(query_lens).cumsum(0).tolist()], dtype=torch.int32
+        )
+        common.query_start_loc.copy_(starts)
+        if sum(query_lens) == 3:
+            common.query_start_loc_cpu.copy_(starts)
+        seq_lens = torch.tensor(
+            [260 + query_lens[0], 520 + query_lens[1], 780 + query_lens[2], 0],
+            dtype=torch.int32,
+        )
+        common.seq_lens.copy_(seq_lens)
+        metadata = builder.build(
+            0,
+            common,
+            selector_state_slot_ids=torch.tensor(
+                [2, 0, 1, -1], dtype=torch.int32, device=device
+            ),
+            selector_state_is_fresh=torch.zeros(4, dtype=torch.bool, device=device),
+            selector_num_accepted_tokens=torch.tensor(
+                [3, 2, 1, 1], dtype=torch.int32, device=device
+            ),
+            selector_is_prefilling=common.is_prefilling.to(device),
+        )
+        assert (
+            metadata.req_id_per_token.data_ptr() == captured.req_id_per_token.data_ptr()
+        )
+        assert (
+            metadata.cache_seq_lens_per_token.data_ptr()
+            == captured.cache_seq_lens_per_token.data_ptr()
+        )
+        if mixed_prefill:
+            assert metadata.num_decodes == 2
+            assert metadata.num_decode_tokens == 8
+            assert metadata.prefill_query_lens_cpu.tolist() == [4, 0]
+        torch.cuda.synchronize()
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        expected_ids = torch.zeros(12, dtype=torch.int32)
+        expected_lens = torch.zeros(12, dtype=torch.int32)
+        for request, length in enumerate(query_lens):
+            start = int(starts[request])
+            expected_ids[start : start + length] = request
+            expected_lens[start : start + length] = torch.arange(
+                int(seq_lens[request]) - length + 1, int(seq_lens[request]) + 1
+            )
+        expected_lens = get_dcp_local_seq_lens(expected_lens, dcp_size, dcp_rank, 4)
+        torch.testing.assert_close(observed_ids.cpu(), expected_ids, rtol=0, atol=0)
+        torch.testing.assert_close(observed_lens.cpu(), expected_lens, rtol=0, atol=0)
+        if dcp_size == 1:
+            expected_attention = attention(
+                expected_ids.to(device), expected_lens.to(device)
+            )
+            torch.testing.assert_close(
+                observed_attention, expected_attention, rtol=0, atol=0
+            )
+
+
+def _pool_reference(
+    key: torch.Tensor, gate: torch.Tensor, ape: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    weights = torch.softmax(gate.float() + ape.float(), dim=0)
+    pooled = (key.float() * weights).sum(dim=0).to(torch.bfloat16).float()
+    rotated = _hadamard128(pooled).to(torch.bfloat16).float()
+    scale = torch.exp2(
+        torch.ceil(torch.log2(rotated.abs().max().clamp_min(1e-4) / 448))
+    )
+    quantized = (rotated / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return quantized, scale
+
+
+def _read_cache_entry(
+    cache: torch.Tensor, physical_page: int, page_offset: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    page_stride = int(cache.stride(0))
+    byte_view = cache.view(torch.uint8).reshape(-1)
+    key_begin = physical_page * page_stride + page_offset * 128
+    scale_begin = physical_page * page_stride + 64 * 128 + page_offset * 4
+    key = byte_view[key_begin : key_begin + 128].view(torch.float8_e4m3fn)
+    scale = byte_view[scale_begin : scale_begin + 4].view(torch.float32)
+    return key, scale
+
+
+def test_glm53_selector_lazily_caches_fp32_head_projection() -> None:
+    hidden_size = 8
+    indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
+    nn.Module.__init__(indexer)
+    indexer.weights_proj = nn.Linear(hidden_size, 32, bias=False, dtype=torch.bfloat16)
+    indexer._weights_proj_fp32 = None
+    hidden = torch.randn(3, hidden_size, dtype=torch.bfloat16)
+
+    expected = torch.nn.functional.linear(
+        hidden.float(), indexer.weights_proj.weight.float()
+    )
+    actual = indexer._project_head_weights(hidden)
+
+    torch.testing.assert_close(actual, expected)
+    assert indexer._weights_proj_fp32 is not None
+    pointer = indexer._weights_proj_fp32.data_ptr()
+    indexer._project_head_weights(hidden)
+    assert indexer._weights_proj_fp32.data_ptr() == pointer
+
+
+def test_glm53_mla_spec_scales_fp8_index_tail_with_manager_block() -> None:
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        state_content_bytes=528,
+        page_tail_bytes_per_token=33,
+        model_version="glm5_next",
+    )
+
+    assert spec.unpadded_page_size_bytes == 256 * 528
+    assert spec.page_size_bytes == 256 * (528 + 33)
+    promoted = spec.copy_with_new_block_size(2304)
+    assert promoted.unpadded_page_size_bytes == 2304 * 528
+    assert promoted.page_size_bytes == 2304 * (528 + 33)
+
+
+def test_glm53_selector_prefill_lengths_do_not_require_attention_backend() -> None:
+    metadata = B12xMLASparseMetadata(
+        num_reqs=2,
+        max_query_len=3,
+        max_seq_len=8,
+        num_actual_tokens=4,
+        query_start_loc=torch.tensor([0, 1, 4], dtype=torch.int32),
+        slot_mapping=torch.empty(4, dtype=torch.int64),
+        block_table=torch.empty((2, 1), dtype=torch.int32),
+        req_id_per_token=torch.tensor([0, 1, 1, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([4, 8], dtype=torch.int32),
+        num_decodes=1,
+        num_prefills=1,
+        num_decode_tokens=1,
+        prefill=None,
+        prefill_query_lens_cpu=torch.tensor([3], dtype=torch.int32),
+        prefill_seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
+    )
+
+    assert metadata.prefill is None
+    assert metadata.prefill_query_lens_cpu.tolist() == [3]
+    assert metadata.prefill_seq_lens_cpu is not None
+    assert metadata.prefill_seq_lens_cpu.tolist() == [8]
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "expected_pages"),
+    [(0, 1), (3, 1), (4, 1), (259, 1), (260, 2), (32768, 128)],
+)
+def test_glm53_active_index_pages_cover_completed_pools(
+    seq_len: int, expected_pages: int
+) -> None:
+    assert Glm5NextPooledIndexer._active_index_page_count(seq_len) == expected_pages
+
+
+def test_glm53_packed_c4_metadata_uses_parent_stride() -> None:
+    device = _require_glm_gpu()
+    source = torch.tensor([[3, 1], [7, -1]], dtype=torch.int32, device=device)
+    expanded = torch.empty((2, 4), dtype=torch.int32, device=device)
+    expand_c4_block_table(
+        source,
+        expanded,
+        rows=2,
+        subpages_per_parent=2,
+        parent_stride_pages=153,
+    )
+    torch.testing.assert_close(
+        expanded.cpu(),
+        torch.tensor([[459, 460, 153, 154], [1071, 1072, -1, -1]], dtype=torch.int32),
+    )
+
+    gathered = torch.empty((3, 4), dtype=torch.int32, device=device)
+    gather_c4_block_table_rows(
+        expanded,
+        torch.tensor([1, 0, 1], dtype=torch.int32, device=device),
+        gathered,
+    )
+    torch.testing.assert_close(gathered.cpu(), expanded[[1, 0, 1]].cpu())
+
+    positions = torch.tensor([0, 3, 4, 7, 8], dtype=torch.int64, device=device)
+    lengths = torch.empty(5, dtype=torch.int32, device=device)
+    pool_seq_lens(positions, lengths)
+    torch.testing.assert_close(
+        lengths.cpu(), torch.tensor([0, 1, 1, 2, 2], dtype=torch.int32)
+    )
+
+    dcp_positions = torch.tensor(
+        [0, 3, 7, 11, 15, 19, 31], dtype=torch.int64, device=device
+    )
+    expected_by_rank = (
+        [0, 1, 1, 1, 1, 2, 2],
+        [0, 0, 1, 1, 1, 1, 2],
+        [0, 0, 0, 1, 1, 1, 2],
+        [0, 0, 0, 0, 1, 1, 2],
+    )
+    for rank, expected in enumerate(expected_by_rank):
+        local_lengths = torch.empty(7, dtype=torch.int32, device=device)
+        pool_seq_lens(
+            dcp_positions,
+            local_lengths,
+            dcp_size=4,
+            dcp_rank=rank,
+            pool_interleave=1,
+        )
+        torch.testing.assert_close(
+            local_lengths.cpu(), torch.tensor(expected, dtype=torch.int32)
+        )
+
+
+@pytest.mark.parametrize(("rows", "requests"), [(1, 1), (7, 4), (32, 32)])
+@pytest.mark.parametrize(
+    ("dcp_size", "dcp_rank", "pool_interleave"),
+    [(1, 0, 1), (4, 2, 1), (4, 3, 2)],
+)
+def test_glm53_c4_decode_metadata_matches_reference(
+    rows: int,
+    requests: int,
+    dcp_size: int,
+    dcp_rank: int,
+    pool_interleave: int,
+) -> None:
+    device = _require_glm_gpu()
+    source_width = 5
+    subpages_per_parent = 9
+    parent_stride_pages = 37
+    source = torch.arange(
+        requests * source_width, dtype=torch.int32, device=device
+    ).reshape(requests, source_width)
+    source[0, -1] = -1
+    source[-1, 0] = 58_000_000
+    request_ids = torch.arange(rows, dtype=torch.int32, device=device) % requests
+    positions = torch.arange(rows, dtype=torch.int64, device=device) * 257 + 3
+
+    expanded = torch.empty(
+        (requests, source_width * subpages_per_parent),
+        dtype=torch.int32,
+        device=device,
+    )
+    expected_table = torch.empty(
+        (rows, source_width * subpages_per_parent),
+        dtype=torch.int32,
+        device=device,
+    )
+    expected_seq_lens = torch.empty(rows, dtype=torch.int32, device=device)
+    actual_table = torch.empty_like(expected_table)
+    actual_seq_lens = torch.empty_like(expected_seq_lens)
+
+    expand_c4_block_table(
+        source,
+        expanded,
+        rows=requests,
+        subpages_per_parent=subpages_per_parent,
+        parent_stride_pages=parent_stride_pages,
+    )
+    gather_c4_block_table_rows(expanded, request_ids, expected_table)
+    pool_seq_lens(
+        positions,
+        expected_seq_lens,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        pool_interleave=pool_interleave,
+    )
+    prepare_c4_decode_metadata(
+        source,
+        request_ids,
+        positions,
+        actual_table,
+        actual_seq_lens,
+        subpages_per_parent=subpages_per_parent,
+        parent_stride_pages=parent_stride_pages,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        pool_interleave=pool_interleave,
+    )
+
+    torch.testing.assert_close(actual_table, expected_table, rtol=0, atol=0)
+    torch.testing.assert_close(actual_seq_lens, expected_seq_lens, rtol=0, atol=0)
+
+
+def test_glm53_c4_decode_metadata_graph_replays_live_inputs() -> None:
+    device = _require_glm_gpu()
+    rows = 7
+    requests = 4
+    source_width = 5
+    subpages_per_parent = 9
+    parent_stride_pages = 37
+    source = torch.arange(
+        requests * source_width, dtype=torch.int32, device=device
+    ).reshape(requests, source_width)
+    request_ids = torch.arange(rows, dtype=torch.int32, device=device) % requests
+    positions = torch.arange(rows, dtype=torch.int64, device=device) * 4 + 3
+    output_table = torch.empty(
+        (rows, source_width * subpages_per_parent),
+        dtype=torch.int32,
+        device=device,
+    )
+    output_seq_lens = torch.empty(rows, dtype=torch.int32, device=device)
+
+    def prepare() -> None:
+        prepare_c4_decode_metadata(
+            source,
+            request_ids,
+            positions,
+            output_table,
+            output_seq_lens,
+            subpages_per_parent=subpages_per_parent,
+            parent_stride_pages=parent_stride_pages,
+            dcp_size=4,
+            dcp_rank=2,
+            pool_interleave=2,
+        )
+
+    prepare()
+    device_module = torch.get_device_module(device)
+    graph = device_module.CUDAGraph()
+    with device_module.graph(graph):
+        prepare()
+
+    source.add_(100)
+    source[1, -1] = -1
+    request_ids.copy_(
+        torch.tensor([3, 1, 2, 0, 3, 2, 1], dtype=torch.int32, device=device)
+    )
+    positions.add_(4096)
+    output_table.fill_(37)
+    output_seq_lens.fill_(37)
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    expanded = torch.empty(
+        (requests, source_width * subpages_per_parent),
+        dtype=torch.int32,
+        device=device,
+    )
+    expected_table = torch.empty_like(output_table)
+    expected_seq_lens = torch.empty_like(output_seq_lens)
+    expand_c4_block_table(
+        source,
+        expanded,
+        rows=requests,
+        subpages_per_parent=subpages_per_parent,
+        parent_stride_pages=parent_stride_pages,
+    )
+    gather_c4_block_table_rows(expanded, request_ids, expected_table)
+    pool_seq_lens(
+        positions,
+        expected_seq_lens,
+        dcp_size=4,
+        dcp_rank=2,
+        pool_interleave=2,
+    )
+    torch.testing.assert_close(output_table, expected_table, rtol=0, atol=0)
+    torch.testing.assert_close(output_seq_lens, expected_seq_lens, rtol=0, atol=0)
+
+    allocated = torch.accelerator.memory_allocated()
+    graph.replay()
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.accelerator.memory_allocated() == allocated
+
+
+def test_glm53_physical_selection_provider_is_explicit() -> None:
+    indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
+    nn.Module.__init__(indexer)
+    indexer.dcp_world_size = 1
+    indexer._emit_physical_selection = True
+    indexer.topk_indices_buffer = torch.empty((8, 2051), dtype=torch.int32)
+    indexer._physical_active_counts = torch.empty(8, dtype=torch.int32)
+
+    selected = indexer.get_b12x_physical_selection(
+        num_tokens=3,
+        num_prefills=0,
+        num_decode_tokens=3,
+    )
+    assert selected is not None
+    assert selected[0].shape == (3, 2051)
+    assert selected[1].shape == (3,)
+    assert (
+        indexer.get_b12x_physical_selection(
+            num_tokens=3,
+            num_prefills=1,
+            num_decode_tokens=2,
+        )
+        is None
+    )
+
+    indexer._emit_physical_selection = False
+    assert (
+        indexer.get_b12x_physical_selection(
+            num_tokens=3,
+            num_prefills=0,
+            num_decode_tokens=3,
+        )
+        is None
+    )
+
+
+def _packed_main_cache(
+    *,
+    device: torch.device,
+    blocks: int,
+    layers: int,
+    block_size: int,
+    layer: int,
+    record_bytes: int = 528,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    semantic_page_bytes = block_size * record_bytes
+    content_page_bytes = ((semantic_page_bytes + 8447) // 8448) * 8448
+    page_bytes = content_page_bytes + block_size * 33
+    raw = torch.zeros(blocks * layers * page_bytes, dtype=torch.uint8, device=device)
+    main = torch.as_strided(
+        raw,
+        size=(blocks, block_size, record_bytes),
+        stride=(layers * page_bytes, record_bytes, 1),
+        storage_offset=layer * page_bytes,
+    )
+    return raw, main
+
+
+def test_glm53_packed_tail_accepts_nvfp4_main_record() -> None:
+    _, main = _packed_main_cache(
+        device=torch.device("cpu"),
+        blocks=2,
+        layers=3,
+        block_size=3328,
+        layer=1,
+        record_bytes=304,
+    )
+
+    index_cache, subpages, parent_stride_pages = (
+        Glm5NextPooledIndexer._index_cache_view(main)
+    )
+
+    assert subpages == 13
+    assert parent_stride_pages == 399
+    assert index_cache.stride() == (8448, 132, 1)
+
+
+def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
+    device = _require_glm_gpu()
+    _, main = _packed_main_cache(
+        device=device, blocks=2, layers=3, block_size=256, layer=1
+    )
+    indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
+    nn.Module.__init__(indexer)
+    indexer.max_tokens = 128
+    indexer.max_seqs = 16
+    indexer.max_model_len = 4096
+    indexer.dcp_world_size = 1
+    indexer.indexer_op = SimpleNamespace(max_model_len=4096 // 4)
+
+    indexer.bind_main_kv_cache(main)
+
+    assert indexer._decode_block_table.shape[0] == indexer.max_tokens
+    assert indexer._decode_block_table.shape[0] > indexer.max_seqs * (5 + 1)
+    assert indexer.indexer_op.max_model_len == 4096 // 4
+
+
+def test_glm53_selector_capacity_tracks_auto_fit_max_model_len() -> None:
+    indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
+    nn.Module.__init__(indexer)
+    indexer.max_model_len = 1_048_576
+    indexer.indexer_op = SimpleNamespace(max_model_len=262_144)
+
+    assert indexer._aligned_max_seq_len == 1_048_576
+
+    indexer.update_max_model_len(1_985)
+    assert indexer._aligned_max_seq_len == 1_988
+    assert indexer.indexer_op.max_model_len == 497
+
+
+def test_glm53_parent_table_width_tracks_dcp_sharding() -> None:
+    max_model_len = 524288
+    block_size = 2304
+
+    assert Glm5NextPooledIndexer._max_parent_table_width(
+        max_model_len,
+        block_size,
+        dcp_world_size=1,
+    ) == math.ceil(max_model_len / block_size)
+    assert Glm5NextPooledIndexer._max_parent_table_width(
+        max_model_len,
+        block_size,
+        dcp_world_size=4,
+    ) == math.ceil(max_model_len / (block_size * 4))
+    assert (
+        Glm5NextPooledIndexer._max_parent_table_width(
+            block_size,
+            block_size,
+            dcp_world_size=1,
+        )
+        == 1
+    )
+
+
+def test_glm53_packed_tail_reuses_c4_page_contract() -> None:
+    device = _require_glm_gpu()
+    _, main = _packed_main_cache(
+        device=device, blocks=2, layers=3, block_size=512, layer=1
+    )
+    index_cache, subpages, parent_stride_pages = (
+        Glm5NextPooledIndexer._index_cache_view(main)
+    )
+    assert subpages == 2
+    assert parent_stride_pages == 102
+    assert index_cache.stride() == (8448, 132, 1)
+
+    generator = torch.Generator(device=device).manual_seed(55)
+    key = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    tail = torch.empty((1, 2, 4, 128), dtype=torch.bfloat16, device=device)
+    update_decode_pools(
+        index_cache,
+        tail,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.tensor([0, 4], dtype=torch.int32, device=device),
+        key,
+        gate,
+        ape,
+        torch.arange(512, 516, dtype=torch.int64, device=device),
+        torch.arange(4, dtype=torch.int64, device=device),
+        1,
+        model_block_size=512,
+        parent_stride_pages=parent_stride_pages,
+    )
+    actual_key, actual_scale = _read_cache_entry(index_cache, parent_stride_pages, 0)
+    expected_key, expected_scale = _pool_reference(key, gate, ape)
+    assert torch.equal(actual_key, expected_key)
+    torch.testing.assert_close(actual_scale, expected_scale.reshape(1), rtol=0, atol=0)
+
+
+def test_glm53_packed_tail_scores_through_existing_c4_indexer() -> None:
+    device = _require_glm_gpu()
+    _, main = _packed_main_cache(
+        device=device, blocks=2, layers=3, block_size=512, layer=1
+    )
+    index_cache, _, parent_stride_pages = Glm5NextPooledIndexer._index_cache_view(main)
+    virtual_page = parent_stride_pages
+    page = index_cache[virtual_page]
+    quant = page.as_strided(
+        (64, 128), (128, 1), storage_offset=page.storage_offset()
+    ).view(torch.float8_e4m3fn)
+    scales = page.as_strided(
+        (64 * 4,),
+        (1,),
+        storage_offset=page.storage_offset() + 64 * 128,
+    ).view(torch.float32)
+    quant.zero_()
+    scales.fill_(1.0)
+    quant[0].fill_(1.0)
+    quant[1].fill_(2.0)
+
+    from vllm.utils.b12x import get_b12x_dsa_indexer
+
+    module = get_b12x_dsa_indexer()
+    assert module is not None
+    q = torch.ones((1, 32, 128), dtype=torch.float8_e4m3fn, device=device)
+    weights = torch.ones((1, 32), dtype=torch.float32, device=device)
+    block_table = torch.tensor([[virtual_page]], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([2], dtype=torch.int32, device=device)
+    plan = module.plan(
+        module.Caps(
+            device=device,
+            num_q_heads=32,
+            max_q_rows=1,
+            max_page_table_width=1,
+            topk=512,
+            mode="decode",
+        )
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    )
+    output = torch.empty((1, 512), dtype=torch.int32, device=device)
+    binding = module.bind(
+        plan,
+        scratch=scratch,
+        q_fp8=q,
+        query_weights=weights,
+        index_k_cache=_flatten_index_cache(index_cache),
+        page_table=block_table,
+        cache_lengths=seq_lens,
+        active_width=torch.ones(1, dtype=torch.int32, device=device),
+        output_indices=output,
+    )
+    module.run(binding)
+    torch.accelerator.synchronize()
+    assert set(output[0, :2].tolist()) == {0, 1}
+    assert torch.all(output[0, 2:] == -1)
+
+    device_module = torch.get_device_module(device)
+    graph = device_module.CUDAGraph()
+    with device_module.graph(graph):
+        module.run(binding)
+    graph.replay()
+    torch.accelerator.synchronize()
+    allocated = torch.accelerator.memory_allocated()
+    graph.replay()
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.accelerator.memory_allocated() == allocated
+    assert set(output[0, :2].tolist()) == {0, 1}
+
+
+def test_glm53_pool_write_matches_fp8_reference() -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(53)
+    key = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=device)
+    tail = torch.empty((1, 2, 4, 128), dtype=torch.bfloat16, device=device)
+    slots = torch.tensor([-1, -1, -1, 0], dtype=torch.int64, device=device)
+
+    update_decode_pools(
+        cache,
+        tail,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.tensor([0, 4], dtype=torch.int32, device=device),
+        key,
+        gate,
+        ape,
+        slots,
+        torch.arange(4, dtype=torch.int64, device=device),
+        1,
+    )
+    actual_key, actual_scale = _read_cache_entry(cache, 0, 0)
+    expected_key, expected_scale = _pool_reference(key, gate, ape)
+
+    assert torch.equal(actual_key, expected_key)
+    torch.testing.assert_close(actual_scale, expected_scale.reshape(1), rtol=0, atol=0)
+
+
+def test_glm53_decode_tail_completes_the_same_pool_as_prefill() -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(54)
+    key = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=device)
+    tail = torch.empty((1, 2, 4, 128), dtype=torch.bfloat16, device=device)
+    state_slots = torch.zeros((1,), dtype=torch.int32, device=device)
+
+    update_decode_pools(
+        cache,
+        tail,
+        state_slots,
+        torch.tensor([0, 3], dtype=torch.int32, device=device),
+        key[:3],
+        gate[:3],
+        ape,
+        torch.full((3,), -1, dtype=torch.int64, device=device),
+        torch.arange(3, dtype=torch.int64, device=device),
+        1,
+    )
+    update_decode_pools(
+        cache,
+        tail,
+        state_slots,
+        torch.tensor([0, 1], dtype=torch.int32, device=device),
+        key[3:],
+        gate[3:],
+        ape,
+        torch.zeros((1,), dtype=torch.int64, device=device),
+        torch.tensor([3], dtype=torch.int64, device=device),
+        1,
+    )
+
+    actual_key, actual_scale = _read_cache_entry(cache, 0, 0)
+    expected_key, expected_scale = _pool_reference(key, gate, ape)
+    assert torch.equal(actual_key, expected_key)
+    torch.testing.assert_close(actual_scale, expected_scale.reshape(1), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tail_capacity", [4, 12])
+def test_glm53_decode_writer_matches_parallel_prefill_writer(
+    tail_capacity: int,
+) -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(56)
+    key = torch.randn(
+        (8, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn(
+        (8, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    prefill_cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=device)
+    decode_cache = torch.zeros_like(prefill_cache)
+    prefill_tail = torch.zeros(
+        (1, 2, tail_capacity, 128), dtype=torch.bfloat16, device=device
+    )
+    decode_tail = torch.zeros_like(prefill_tail)
+    state_slots = torch.zeros(1, dtype=torch.int32, device=device)
+
+    update_decode_pools(
+        prefill_cache,
+        prefill_tail,
+        state_slots,
+        torch.tensor([0, 8], dtype=torch.int32, device=device),
+        key,
+        gate,
+        ape,
+        torch.tensor([-1, -1, -1, 3, -1, -1, -1, 7], device=device),
+        torch.arange(8, dtype=torch.int64, device=device),
+        1,
+        num_decode_requests=0,
+        max_query_len=8,
+        model_block_size=256,
+        parent_stride_pages=1,
+    )
+    for position in range(8):
+        update_decode_pools(
+            decode_cache,
+            decode_tail,
+            state_slots,
+            torch.tensor([0, 1], dtype=torch.int32, device=device),
+            key[position : position + 1],
+            gate[position : position + 1],
+            ape,
+            torch.tensor(
+                [position if position % 4 == 3 else -1],
+                dtype=torch.int64,
+                device=device,
+            ),
+            torch.tensor([position], dtype=torch.int64, device=device),
+            1,
+            model_block_size=256,
+            parent_stride_pages=1,
+        )
+
+    assert torch.equal(decode_cache, prefill_cache)
+    assert torch.equal(decode_tail, prefill_tail)
+
+
+@pytest.mark.parametrize("tail_capacity", [4, 12])
+def test_glm53_parallel_prefill_preserves_boundary_tail_and_state_slots(
+    tail_capacity: int,
+) -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(5304)
+    key = torch.randn(
+        (10, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn(
+        (10, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    initial_tail = torch.randn(
+        (2, 2, tail_capacity, 128),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    sequential_tail = initial_tail.clone()
+    parallel_tail = initial_tail.clone()
+    sequential_cache = torch.zeros((2, 64, 132), dtype=torch.uint8, device=device)
+    parallel_cache = torch.zeros_like(sequential_cache)
+    state_slots = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 5, 10], dtype=torch.int32, device=device)
+    positions = torch.tensor(
+        [4099, 4100, 4101, 4102, 4103, 4099, 4100, 4101, 4102, 4103],
+        dtype=torch.int64,
+        device=device,
+    )
+    slot_mapping = torch.tensor(
+        [3, -1, -1, -1, 7, 259, -1, -1, -1, 263],
+        dtype=torch.int64,
+        device=device,
+    )
+    common = dict(model_block_size=256, parent_stride_pages=1)
+
+    update_decode_pools(
+        sequential_cache,
+        sequential_tail,
+        state_slots,
+        query_start_loc,
+        key,
+        gate,
+        ape,
+        slot_mapping,
+        positions,
+        2,
+        **common,
+    )
+    update_decode_pools(
+        parallel_cache,
+        parallel_tail,
+        state_slots,
+        query_start_loc,
+        key,
+        gate,
+        ape,
+        slot_mapping,
+        positions,
+        2,
+        num_decode_requests=0,
+        max_query_len=5,
+        **common,
+    )
+
+    assert torch.equal(parallel_cache, sequential_cache)
+    assert torch.equal(parallel_tail, sequential_tail)
+
+
+@pytest.mark.parametrize("resume_prefill", [False, True])
+def test_glm53_selector_preserves_committed_pool_after_speculative_rejection(
+    resume_prefill: bool,
+) -> None:
+    """Rejected rows must not overwrite the raw keys of the committed C4 tail."""
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(5306)
+    key = torch.randn(
+        (33, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn(
+        (33, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=device)
+    tail = torch.zeros((1, 2, 12, 128), dtype=torch.bfloat16, device=device)
+    state_slots = torch.zeros(1, dtype=torch.int32, device=device)
+
+    for start, end in ((0, 25), (25, 31)):
+        positions = torch.arange(start, end, dtype=torch.int64, device=device)
+        update_decode_pools(
+            cache,
+            tail,
+            state_slots,
+            torch.tensor([0, end - start], dtype=torch.int32, device=device),
+            key[start:end],
+            gate[start:end],
+            ape,
+            positions,
+            positions,
+            1,
+            num_decode_requests=int(start != 0),
+            max_query_len=end - start,
+            model_block_size=256,
+            parent_stride_pages=1,
+        )
+
+    # Only position 25 committed. Replace the rejected positions 26 and 27.
+    positions = torch.tensor([26, 27], dtype=torch.int64, device=device)
+    update_decode_pools(
+        cache,
+        tail.clone(),
+        state_slots,
+        torch.tensor([0, 2], dtype=torch.int32, device=device),
+        key[31:],
+        gate[31:],
+        ape,
+        positions,
+        positions,
+        1,
+        num_decode_requests=int(not resume_prefill),
+        max_query_len=2,
+        model_block_size=256,
+        parent_stride_pages=1,
+    )
+    actual_key, actual_scale = _read_cache_entry(cache, 0, 6)
+    expected_key, expected_scale = _pool_reference(
+        torch.cat((key[24:26], key[31:])),
+        torch.cat((gate[24:26], gate[31:])),
+        ape,
+    )
+    assert torch.equal(actual_key, expected_key)
+    torch.testing.assert_close(actual_scale, expected_scale.reshape(1), rtol=0, atol=0)
+
+
+def test_glm53_parallel_prefill_ignores_invalid_dummy_slots() -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(5305)
+    key = torch.randn(
+        (8, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn(
+        (8, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=device)
+    initial_tail = torch.randn(
+        (1, 2, 4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    tail = initial_tail.clone()
+
+    update_decode_pools(
+        cache,
+        tail,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.tensor([0, 8], dtype=torch.int32, device=device),
+        key,
+        gate,
+        ape,
+        torch.full((8,), -1, dtype=torch.int64, device=device),
+        torch.zeros(8, dtype=torch.int64, device=device),
+        1,
+        num_decode_requests=0,
+        max_query_len=8,
+        model_block_size=256,
+        parent_stride_pages=1,
+    )
+
+    assert torch.count_nonzero(cache).item() == 0
+    torch.testing.assert_close(tail[0, 0, 0], key[-1])
+    torch.testing.assert_close(tail[0, 1, 0], gate[-1])
+    assert torch.equal(tail[:, :, 1:], initial_tail[:, :, 1:])
+
+
+def test_glm53_tail_state_isolated_between_requests() -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(57)
+    keys = torch.randn(
+        (2, 4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gates = torch.randn(
+        (2, 4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=device)
+    tail = torch.full((2, 2, 4, 128), float("nan"), dtype=torch.bfloat16, device=device)
+    state_slots = torch.tensor([1, 0], dtype=torch.int32, device=device)
+
+    update_decode_pools(
+        cache,
+        tail,
+        state_slots,
+        torch.tensor([0, 3, 6], dtype=torch.int32, device=device),
+        torch.cat((keys[0, :3], keys[1, :3])),
+        torch.cat((gates[0, :3], gates[1, :3])),
+        ape,
+        torch.full((6,), -1, dtype=torch.int64, device=device),
+        torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int64, device=device),
+        2,
+    )
+    torch.testing.assert_close(tail[1, 0, :3], keys[0, :3])
+    torch.testing.assert_close(tail[1, 1, :3], gates[0, :3])
+    torch.testing.assert_close(tail[0, 0, :3], keys[1, :3])
+    torch.testing.assert_close(tail[0, 1, :3], gates[1, :3])
+    update_decode_pools(
+        cache,
+        tail,
+        state_slots,
+        torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+        keys[:, 3],
+        gates[:, 3],
+        ape,
+        torch.tensor([0, 1], dtype=torch.int64, device=device),
+        torch.tensor([3, 3], dtype=torch.int64, device=device),
+        2,
+    )
+
+    for request in range(2):
+        actual_key, actual_scale = _read_cache_entry(cache, 0, request)
+        expected_key, expected_scale = _pool_reference(
+            keys[request], gates[request], ape
+        )
+        assert torch.equal(actual_key, expected_key)
+        torch.testing.assert_close(
+            actual_scale, expected_scale.reshape(1), rtol=0, atol=0
+        )
+
+
+def test_glm53_pool_expansion_appends_only_the_incomplete_tail() -> None:
+    device = _require_glm_gpu()
+    pool_ids = torch.full((3, 512), -1, dtype=torch.int32, device=device)
+    pool_ids[1, :2] = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    pool_ids[2] = torch.arange(512, dtype=torch.int32, device=device)
+    positions = torch.tensor([2, 7, 2052], dtype=torch.int64, device=device)
+    output = torch.empty((3, 2051), dtype=torch.int32, device=device)
+
+    expand_pool_ids(pool_ids, positions, output)
+
+    assert torch.all(output[0, :2048] == -1)
+    assert torch.equal(
+        output[0, 2048:].cpu(), torch.tensor([0, 1, 2], dtype=torch.int32)
+    )
+    assert torch.equal(output[1, :8].cpu(), torch.tensor([4, 5, 6, 7, 0, 1, 2, 3]))
+    assert torch.all(output[1, 8:] == -1)
+    assert torch.equal(output[2, :2048].cpu(), torch.arange(2048, dtype=torch.int32))
+    assert int(output[2, 2048]) == 2052
+    assert torch.all(output[2, 2049:] == -1)
+
+
+def test_glm53_pool_write_uses_int64_for_live_high_page() -> None:
+    device = _require_glm_gpu()
+    block_size = 256
+    parent_page_bytes = block_size * (528 + 33)
+    high_page = 2**31 // parent_page_bytes + 1
+    raw = torch.empty(
+        (high_page + 1) * parent_page_bytes, dtype=torch.uint8, device=device
+    )
+    main = torch.as_strided(
+        raw,
+        size=(high_page + 1, block_size, 528),
+        stride=(parent_page_bytes, 528, 1),
+    )
+    cache, _, parent_stride_pages = Glm5NextPooledIndexer._index_cache_view(main)
+    key = torch.ones((4, 128), dtype=torch.bfloat16, device=device)
+    gate = torch.zeros_like(key)
+    ape = torch.zeros_like(key)
+    slots = high_page * block_size + torch.arange(4, dtype=torch.int64, device=device)
+    tail = torch.empty((1, 2, 4, 128), dtype=torch.bfloat16, device=device)
+    update_decode_pools(
+        cache,
+        tail,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.tensor([0, 4], dtype=torch.int32, device=device),
+        key,
+        gate,
+        ape,
+        slots,
+        torch.arange(4, dtype=torch.int64, device=device),
+        1,
+        model_block_size=block_size,
+        parent_stride_pages=parent_stride_pages,
+    )
+    written_key, written_scale = _read_cache_entry(
+        cache, high_page * parent_stride_pages, 0
+    )
+
+    assert torch.count_nonzero(written_key).item() == 1
+    assert torch.isfinite(written_scale).all()
+    assert float(written_scale[0]) > 0
+
+
+def test_glm53_pool_expansion_replays_without_allocation() -> None:
+    device = _require_glm_gpu()
+    pool_ids = torch.arange(512, dtype=torch.int32, device=device).repeat(2, 1)
+    positions = torch.tensor([2048, 2049], dtype=torch.int64, device=device)
+    output = torch.empty((2, 2051), dtype=torch.int32, device=device)
+    expand_pool_ids(pool_ids, positions, output)
+    device_module = torch.get_device_module(device)
+    graph = device_module.CUDAGraph()
+    with device_module.graph(graph):
+        expand_pool_ids(pool_ids, positions, output)
+    graph.replay()
+    torch.accelerator.synchronize()
+    allocated = torch.accelerator.memory_allocated()
+    graph.replay()
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.accelerator.memory_allocated() == allocated
