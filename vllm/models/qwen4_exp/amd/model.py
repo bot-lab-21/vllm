@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inference-only Qwen4Exp model."""
+"""Inference-only Qwen3.8-Flash-Next model."""
 
-from collections.abc import Iterable
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable
+from importlib import import_module
 from itertools import islice
 
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
-from vllm.model_executor.layers.fused_moe.utils import (
-    is_model_fused_shared_expert_compatible,
-)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -25,7 +26,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -68,42 +68,34 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
-from vllm.transformers_utils.configs.qwen4_exp import (
-    Qwen4ExpTextConfig,
-)
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.kv_cache_interface import MambaSpec
 
-from ..config import Qwen4ExpConfig
-from .hyperconnection import GatedResidual, HyperConnectionConfig
-from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
-from .ple_layer import Qwen4ExpPLELayer
-from .qsa import Qwen4ExpQSAAttention
-
-
-def without_modelopt_fp4(
-    quant_config: QuantizationConfig | None,
-) -> QuantizationConfig | None:
-    """Return ``None`` for weights excluded from Qwen4Exp ModelOpt-FP4."""
-
-    if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-        return None
-    return quant_config
+from .config import Qwen3_8FlashNextConfig, Qwen3_8FlashNextTextConfig
+from .hyperconnection import (
+    GatedResidual,
+    HyperConnectionConfig,
+    HyperConnectionWorkspace,
+)
+from .ple_layer import Qwen3_8FlashNextPLELayer, _resolve_ple_table_memory
 
 
-def _remap_qsa_cache_scale_name(
-    name: str,
-    qsa_layer_ids: frozenset[int],
-) -> str:
-    """Map serialized main-cache scales onto the merged QSA owner.
+def _is_mmap_ple_weight(name: str) -> bool:
+    _, marker, shard_suffix = name.rpartition(
+        ".ple.ple_embedding.ngram_embedding.shard_"
+    )
+    shard_index, separator, suffix = shard_suffix.partition(".")
+    return bool(
+        marker
+        and separator
+        and shard_index.isdigit()
+        and suffix in {"weight", "weight_scale"}
+    )
 
-    Regular attention keeps cache scales below its ``attn`` child. QSA owns
-    that cache directly, so only QSA layers need the final path component
-    moved to the owner's persistent ``_k_scale``/``_v_scale`` buffers.
-    """
 
+def _remap_qsa_cache_scale_name(name: str, qsa_layer_ids: frozenset[int]) -> str:
     scale_suffixes = {
         "k_proj.k_scale": "_k_scale",
         "k_proj.output_scale": "_k_scale",
@@ -121,16 +113,15 @@ def _remap_qsa_cache_scale_name(
     for layer_id in qsa_layer_ids:
         marker = f"layers.{layer_id}.self_attn."
         marker_start = name.find(marker)
-        if marker_start < 0 or (marker_start > 0 and name[marker_start - 1] != "."):
+        if marker_start < 0 or (marker_start and name[marker_start - 1] != "."):
             continue
         suffix = name[marker_start + len(marker) :]
-        mapped_suffix = scale_suffixes.get(suffix)
-        if mapped_suffix is not None:
-            return f"{name[: marker_start + len(marker)]}{mapped_suffix}"
+        if suffix in scale_suffixes:
+            return f"{name[: marker_start + len(marker)]}{scale_suffixes[suffix]}"
     return name
 
 
-_QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
+_QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES = [
     ".bias",
     "_bias",
     ".k_scale",
@@ -141,8 +132,6 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_input_scale",
 ]
 
-# The checkpoint keeps down and injection projections separate; runtime packs
-# them into adjacent logical shards of one MergedColumnParallelLinear.
 _HC_WEIGHTS_MAPPER = WeightsMapper(
     orig_to_new_stacked={
         "hyper_connection.input_mix_weight_down.weight": (
@@ -157,53 +146,38 @@ _HC_WEIGHTS_MAPPER = WeightsMapper(
 )
 
 
-class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
-    """Qwen3Next MoE with Qwen4Exp HC validation."""
-
+class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.use_sequence_parallel_moe:
+        if vllm_config.parallel_config.use_sequence_parallel_moe:
             raise NotImplementedError(
-                "Qwen4Exp HC does not support sequence-parallel MoE"
+                "Qwen3.8-Flash-Next HC does not support sequence-parallel MoE"
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_text_config
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
 
 
-class Qwen4ExpDecoderLayer(nn.Module):
+class Qwen3_8FlashNextDecoderLayer(nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
         layer_type: str,
+        workspace: HyperConnectionWorkspace,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
-        model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
-
+        config: Qwen3_8FlashNextTextConfig = vllm_config.model_config.hf_text_config
         self.config = config
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
-        if vllm_config.parallel_config.use_sequence_parallel_moe:
-            raise NotImplementedError(
-                "Qwen4Exp HC does not support sequence-parallel MoE"
-            )
-        self.ple: Qwen4ExpPLELayer | None = None
-        ple_layer_ids = config.ple_layer_ids
-        if (self.layer_idx + 1) in ple_layer_ids:
-            ple_layer_ids_sorted = sorted(set(ple_layer_ids))
-            ple_dense_layer_id_map = {
-                abs_id: idx for idx, abs_id in enumerate(ple_layer_ids_sorted)
-            }
-            ple_dense_layer_id = ple_dense_layer_id_map[self.layer_idx + 1]
-            self.ple = Qwen4ExpPLELayer(
+        self.ple: Qwen3_8FlashNextPLELayer | None = None
+        if self.layer_idx + 1 in config.ple_layer_ids:
+            dense_ids = sorted(set(config.ple_layer_ids))
+            self.ple = Qwen3_8FlashNextPLELayer(
                 config,
                 vllm_config=vllm_config,
                 layer_idx=self.layer_idx,
-                ple_dense_layer_id=ple_dense_layer_id,
+                ple_dense_layer_id=dense_ids.index(self.layer_idx + 1),
                 prefix=f"{prefix}.ple",
             )
 
@@ -213,36 +187,37 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
+                prefer_b12x_gdn_decode=True,
+                overlap_input_projections=envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP,
             )
         elif layer_type == "full_attention":
-            use_qsa = getattr(config, "indexer_n_heads", None) is not None
-            if not use_qsa:
+            if getattr(config, "indexer_n_heads", None) is None:
                 self.self_attn = Qwen3NextAttention(
                     config,
-                    model_config=model_config,
-                    cache_config=cache_config,
-                    quant_config=quant_config,
+                    model_config=vllm_config.model_config,
+                    cache_config=vllm_config.cache_config,
+                    quant_config=vllm_config.quant_config,
                     prefix=f"{prefix}.self_attn",
                 )
             else:
-                self.self_attn = Qwen4ExpQSAAttention(
+                qsa_module = import_module("vllm.models.qwen3_8_flash_next.qsa")
+                self.self_attn = qsa_module.Qwen3_8FlashNextQSAAttention(
                     vllm_config=vllm_config,
                     config=config,
                     layer_id=self.layer_idx,
-                    quant_config=quant_config,
+                    quant_config=vllm_config.quant_config,
                     prefix=f"{prefix}.self_attn",
                 )
         else:
-            raise ValueError(f"Invalid layer_type {layer_type}")
+            raise ValueError(f"invalid layer_type {layer_type!r}")
 
-        mlp_only_layers = getattr(config, "mlp_only_layers", [])
         num_experts = getattr(config, "num_experts", 0) or 0
         absolute_layer_id = self.layer_idx + 1
-        is_moe_layer = self.layer_idx not in mlp_only_layers and (
-            num_experts > 0 and absolute_layer_id % config.decoder_sparse_step == 0
+        is_moe = self.layer_idx not in getattr(config, "mlp_only_layers", []) and (
+            num_experts > 0 and absolute_layer_id % int(config.decoder_sparse_step) == 0
         )
-        if is_moe_layer:
-            self.mlp = Qwen4ExpSparseMoeBlock(
+        if is_moe:
+            self.mlp = Qwen3_8FlashNextSparseMoeBlock(
                 vllm_config=vllm_config, prefix=f"{prefix}.mlp"
             )
         else:
@@ -250,7 +225,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=vllm_config.quant_config,
                 prefix=f"{prefix}.mlp",
             )
 
@@ -260,14 +235,15 @@ class Qwen4ExpDecoderLayer(nn.Module):
             params_dtype=torch.bfloat16,
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
-            hc_per_branch_norm=True,
         )
         self.attn_hyper_connection = GatedResidual(
             hc_config,
+            workspace,
             prefix=maybe_prefix(prefix, "attn_hyper_connection"),
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
+            workspace,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
 
@@ -281,17 +257,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
+        ple_prefetched: bool = False,
+        output_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
         if self.ple is not None:
-            # PLE adds directly to the multi-stream state, so pending HC state
-            # must be materialized before the addition.
             if prev_block_output is not None and prev_injection is not None:
                 hidden_states = attn_hc.combine(
                     hidden_states, prev_block_output, prev_injection
                 )
                 prev_block_output = prev_injection = None
-
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
             hidden_states = hidden_states + self.ple(
@@ -299,9 +274,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 input_ids,
                 query_start_loc,
                 ngram_context,
+                prefetched=ple_prefetched,
             )
-
-        # Fuse a pending combine with this HC module's mix when possible.
         if prev_block_output is not None and prev_injection is not None:
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
                 hidden_states, prev_block_output, prev_injection
@@ -311,37 +285,34 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
-        elif self.layer_type == "full_attention":
-            attn_out = self.self_attn(
-                hidden_states=block_input,
-                positions=positions,
-            )
         else:
-            raise ValueError("Invalid layer_type")
-
-        mlp_hc = self.mlp_hyper_connection
-        hidden_states, block_input, injection = mlp_hc.combine_and_mix(
-            hidden_states, attn_out, injection
+            attn_out = self.self_attn(hidden_states=block_input, positions=positions)
+        if output_indices is not None:
+            hidden_states = hidden_states[output_indices]
+            attn_out = attn_out[output_indices]
+            assert injection is not None
+            injection = injection[output_indices]
+        hidden_states, block_input, injection = (
+            self.mlp_hyper_connection.combine_and_mix(
+                hidden_states, attn_out, injection
+            )
         )
         mlp_out = self.mlp(block_input)
         return hidden_states, mlp_out, injection
 
 
-class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
-    """Expose Qwen4Exp routed experts through vLLM's EPLB protocol."""
-
+class Qwen3_8FlashNextMixtureOfExperts(MixtureOfExperts):
     def set_moe_parameters(self, layers: Iterable[nn.Module]) -> None:
         self.moe_layers = []
         self.moe_mlp_layers = []
         example_moe = None
         for layer in layers:
-            if isinstance(layer, Qwen4ExpDecoderLayer) and isinstance(
-                layer.mlp, Qwen4ExpSparseMoeBlock
+            if isinstance(layer, Qwen3_8FlashNextDecoderLayer) and isinstance(
+                layer.mlp, Qwen3_8FlashNextSparseMoeBlock
             ):
                 example_moe = layer.mlp
                 self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)
-
         self.num_moe_layers = len(self.moe_layers)
         if example_moe is None:
             self.num_expert_groups = 0
@@ -352,7 +323,6 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             self.num_routed_experts = 0
             self.num_redundant_experts = 0
             return
-
         self.num_expert_groups = 1
         self.num_shared_experts = example_moe.n_shared_experts
         self.num_logical_experts = example_moe.n_logical_experts
@@ -388,58 +358,55 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         "deepstack_input_embeds": 0,
     }
 )
-class Qwen4ExpModel(nn.Module):
+class Qwen3_8FlashNextModel(nn.Module):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _HC_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+        config: Qwen3_8FlashNextTextConfig = vllm_config.model_config.hf_text_config
         self.config = config
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
         self.vocab_size = config.vocab_size
         self._qsa_layer_ids = frozenset(
-            layer_idx
-            for layer_idx, layer_type in enumerate(config.layer_types)
+            index
+            for index, layer_type in enumerate(config.layer_types)
             if layer_type == "full_attention"
             and getattr(config, "indexer_n_heads", None) is not None
         )
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        hc_config = HyperConnectionConfig(
+            hc_count=config.hc_count,
+            hidden_size=config.hidden_size,
+            params_dtype=torch.bfloat16,
+            hc_lowrank=config.hc_lowrank,
+            rms_norm_eps=config.rms_norm_eps,
+        )
+        self.hyper_connection_workspace = HyperConnectionWorkspace(
+            hc_config, vllm_config.scheduler_config.max_num_batched_tokens
+        )
 
-        def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
+        def get_layer(prefix: str) -> Qwen3_8FlashNextDecoderLayer:
             layer_idx = extract_layer_index(prefix)
-            return Qwen4ExpDecoderLayer(
+            return Qwen3_8FlashNextDecoderLayer(
                 vllm_config,
-                layer_type=config.layer_types[layer_idx],
+                config.layer_types[layer_idx],
+                self.hyper_connection_workspace,
                 prefix=prefix,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
-        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
-            self.layers,
-            Qwen4ExpSparseMoeBlock,
-            "mlp",
-        )
-        intermediate_size = config.hidden_size * config.hc_count
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], intermediate_size
+            ["hidden_states"], config.hidden_size * config.hc_count
         )
-
         self.hyper_connection_mixer: GatedResidual | None
         if get_pp_group().is_last_rank:
-            hc_config = HyperConnectionConfig(
-                hc_count=config.hc_count,
-                hidden_size=config.hidden_size,
-                params_dtype=torch.bfloat16,
-                hc_lowrank=config.hc_lowrank,
-                rms_norm_eps=config.rms_norm_eps,
-                hc_per_branch_norm=True,
-            )
             self.hyper_connection_mixer = GatedResidual(
                 hc_config,
+                self.hyper_connection_workspace,
                 use_combine=False,
                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
             )
@@ -447,24 +414,24 @@ class Qwen4ExpModel(nn.Module):
             self.hyper_connection_mixer = None
 
         spec_config = vllm_config.speculative_config
-        # MTP HC multi-stream outputs: when speculative method=="mtp" and the
-        # model uses HC with hc_count>1, retain the pre-final-mixer multi-stream
-        # hidden state [T, hc_count*H] so the MTP drafter can feed a real
-        # multi-stream backbone hidden on its first step (scheme A). Derived
-        # purely from config (NOT node identity) so P/D nodes stay consistent.
         needs_mtp_hidden = (
             spec_config is not None
             and getattr(spec_config, "method", None) == "mtp"
             and get_pp_group().is_last_rank
         )
         if needs_mtp_hidden:
-            self._mtp_hidden_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                config.hc_count * config.hidden_size,
-                dtype=vllm_config.model_config.dtype,
+            self.register_buffer(
+                "_mtp_hidden_buffer",
+                torch.empty(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    config.hc_count * config.hidden_size,
+                    dtype=vllm_config.model_config.dtype,
+                    device=current_platform.current_device(),
+                ),
+                persistent=False,
             )
         else:
-            self._mtp_hidden_buffer = None
+            self.register_buffer("_mtp_hidden_buffer", None, persistent=False)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -495,19 +462,37 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
+        ple_prefetched = False
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
             last_layer = layer
+            next_ple_prefetched = False
+            if (
+                envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP
+                and current_platform.is_cuda()
+                and layer_idx + 1 < self.end_layer
+                and input_ids is not None
+                and query_start_loc is not None
+                and ngram_context is not None
+            ):
+                next_ple = self.layers[layer_idx + 1].ple
+                if next_ple is not None:
+                    next_ple.ple_embedding.prefetch(
+                        input_ids, query_start_loc, ngram_context
+                    )
+                    next_ple_prefetched = True
             hidden_states, block_output, injection = layer(
-                hidden_states=hidden_states,
-                prev_block_output=block_output,
-                prev_injection=injection,
-                positions=positions,
+                hidden_states,
+                block_output,
+                injection,
+                positions,
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
+                ple_prefetched=ple_prefetched,
             )
+            ple_prefetched = next_ple_prefetched
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
             ):
@@ -523,90 +508,57 @@ class Qwen4ExpModel(nn.Module):
                     )
                     .flatten(-2)
                 )
-                # Deepstack is an external addition to the materialized
-                # multi-stream state and therefore terminates delayed combine.
                 hidden_states = layer.mlp_hyper_connection.combine(
-                    hidden_states, block_output, injection
+                    hidden_states,
+                    block_output,
+                    injection,
                 )
-                block_output = None
-                injection = None
+                block_output = injection = None
                 hidden_states = hidden_states + deepstack_embed
 
         if not get_pp_group().is_last_rank:
-            # PP transports one tensor, not the delayed HC tuple. Materialize
-            # with the HC module that produced the pending injection.
             if last_layer is not None and block_output is not None:
                 hidden_states = last_layer.mlp_hyper_connection.combine(
                     hidden_states, block_output, injection
                 )
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        # The final mixer consumes the last pending combine and returns both
-        # the sampled single stream and the materialized multi-stream state.
         final_mixer = self.hyper_connection_mixer
         assert final_mixer is not None
         multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
             hidden_states, block_output, injection
         )
         if self._mtp_hidden_buffer is not None:
-            # Capture the pre-final-mixer multi-stream hidden state
-            # [T, hc_count*H] for the MTP drafter (zero extra compute:
-            # this tensor is needed by the final mixer regardless).
-            num_tokens = multi_hidden.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+            self._mtp_hidden_buffer[: multi_hidden.shape[0]].copy_(multi_hidden)
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = (
-            (
-                _remap_qsa_cache_scale_name(name, self._qsa_layer_ids),
-                weight,
-            )
+            (_remap_qsa_cache_scale_name(name, self._qsa_layer_ids), weight)
             for name, weight in weights
         )
         weights = maybe_fuse_shared_experts(
             weights,
-            enabled=self.is_fused_shared_expert_enabled,
             n_routed_experts=getattr(self.config, "num_experts", 0) or 0,
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
         )
-        # Non-persistent PLE state rebuilt in __init__; skip any ckpt
-        # column for them.
-        skip_substrs = (
-            "hashstats_",
-            "token_lookup",
-            "hyper_connection_mixer.block_inject_weight",
-        )
-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={substr: None for substr in skip_substrs}
-        )
-        # The final HC mixer only exists on the last PP rank; earlier ranks
-        # must drop its checkpoint weights instead of failing to place them.
-        ignore_prefixes = (
-            None
-            if self.hyper_connection_mixer is not None
-            else ["hyper_connection_mixer."]
-        )
         loader = AutoWeightsLoader(
             self,
-            ignore_unexpected_prefixes=ignore_prefixes,
-            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+            ignore_unexpected_suffixes=(
+                _QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy()
+            ),
         )
-        loaded = loader.load_weights(
-            weights,
-            mapper=mapper,
-        )
-        return loaded
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
-class Qwen4ExpForCausalLM(
+class Qwen3_8FlashNextForCausalLM(
     nn.Module,
     HasInnerState,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
-    Qwen4ExpMixtureOfExperts,
+    Qwen3_8FlashNextMixtureOfExperts,
     IsHybrid,
 ):
     packed_modules_mapping = {
@@ -621,13 +573,16 @@ class Qwen4ExpForCausalLM(
         ],
     }
     hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"model.language_model.": "model."}
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "mtp.": None,
+        }
     )
     requires_raw_input_tokens = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+        config: Qwen3_8FlashNextTextConfig = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.quant_config = vllm_config.quant_config
@@ -635,10 +590,11 @@ class Qwen4ExpForCausalLM(
         self.scheduler_config = vllm_config.scheduler_config
         if vllm_config.cache_config.mamba_cache_mode == "all":
             raise NotImplementedError(
-                "Qwen4Exp currently does not support 'all' prefix caching, "
-                "please use '--mamba-cache-mode=align' instead"
+                "Qwen3.8-Flash-Next requires --mamba-cache-mode=align"
             )
-        self.model = Qwen4ExpModel(
+        if config.ple_layer_ids and vllm_config.parallel_config.enable_dbo:
+            raise NotImplementedError("Qwen3.8-Flash-Next PLE does not support DBO")
+        self.model = Qwen3_8FlashNextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.lm_head = ParallelLMHead(
@@ -646,18 +602,20 @@ class Qwen4ExpForCausalLM(
             config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            lm_head=self.lm_head,
+        )
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
-        enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
 
     @staticmethod
     def get_model_state_cls():
-        from .model_state import Qwen4ExpModelState
+        from .model_state import Qwen3_8FlashNextModelState
 
-        return Qwen4ExpModelState
+        return Qwen3_8FlashNextModelState
 
     def forward(
         self,
@@ -667,8 +625,6 @@ class Qwen4ExpForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
-        # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
         return self.model(
             input_ids,
             positions,
@@ -682,8 +638,7 @@ class Qwen4ExpForCausalLM(
 
     @classmethod
     def get_ple_mamba_state_dtype_from_config(
-        cls,
-        vllm_config: VllmConfig,
+        cls, vllm_config: VllmConfig
     ) -> tuple[torch.dtype, ...]:
         return MambaStateDtypeCalculator.short_conv_state_dtype(
             vllm_config.model_config.dtype,
@@ -694,22 +649,13 @@ class Qwen4ExpForCausalLM(
     def get_ple_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[tuple[int, int]]:
-        hf_config = vllm_config.model_config.hf_text_config
-        conv_kernel_size = hf_config.ple_conv_kernel_size
-        short_conv_dilation = hf_config.ngram_size
-        conv_state_len = (conv_kernel_size - 1) * short_conv_dilation
-        num_spec = (
-            vllm_config.speculative_config.num_speculative_tokens
-            if vllm_config.speculative_config
-            else 0
-        )
-        hc_count = hf_config.hc_count
-        hc_hidden_size = hf_config.hidden_size * hc_count
+        config = vllm_config.model_config.hf_text_config
+        state_len = (config.ple_conv_kernel_size - 1) * config.ngram_size
         return MambaStateShapeCalculator.short_conv_state_shape(
-            tp_world_size=1,
-            intermediate_size=hc_hidden_size,
-            conv_kernel=conv_state_len + 1,
-            num_spec=num_spec,
+            1,
+            config.hidden_size * config.hc_count,
+            state_len + 1,
+            vllm_config.num_speculative_tokens,
         )
 
     @classmethod
@@ -725,37 +671,20 @@ class Qwen4ExpForCausalLM(
     @classmethod
     def get_gdn_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        parallel_config = vllm_config.parallel_config
-        hf_config = vllm_config.model_config.hf_text_config
-        tp_size = parallel_config.tensor_parallel_size
-        num_spec = (
-            vllm_config.speculative_config.num_speculative_tokens
-            if vllm_config.speculative_config
-            else 0
-        )
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        config = vllm_config.model_config.hf_text_config
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
-            tp_size,
-            hf_config.linear_num_key_heads,
-            hf_config.linear_num_value_heads,
-            hf_config.linear_key_head_dim,
-            hf_config.linear_value_head_dim,
-            hf_config.linear_conv_kernel_dim,
-            num_spec,
+            vllm_config.parallel_config.tensor_parallel_size,
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+            config.linear_conv_kernel_dim,
+            vllm_config.num_speculative_tokens,
         )
 
-    @classmethod
-    def get_mamba_state_dtype_from_config(
-        cls,
-        vllm_config: VllmConfig,
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return cls.get_gdn_mamba_state_dtype_from_config(vllm_config)
-
-    @classmethod
-    def get_mamba_state_shape_from_config(
-        cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        return cls.get_gdn_mamba_state_shape_from_config(vllm_config)
+    get_mamba_state_dtype_from_config = get_gdn_mamba_state_dtype_from_config
+    get_mamba_state_shape_from_config = get_gdn_mamba_state_shape_from_config
 
     @classmethod
     def get_mamba_state_copy_func(
@@ -768,43 +697,21 @@ class Qwen4ExpForCausalLM(
         cls,
         mamba_types: set[MambaAttentionBackendEnum],
     ) -> MambaStateCopyFuncsByType:
-        copy_funcs_by_type = {
+        copy_funcs = {
             MambaAttentionBackendEnum.GDN_ATTN: cls.get_mamba_state_copy_func(),
             MambaAttentionBackendEnum.SHORT_CONV: (
                 MambaStateCopyFuncCalculator.short_conv_state_copy_func()
             ),
         }
-        missing_types = mamba_types - copy_funcs_by_type.keys()
-        assert not missing_types, f"missing state copy funcs for {missing_types}"
-        return {
-            mamba_type: copy_funcs_by_type[mamba_type] for mamba_type in mamba_types
-        }
-
-    @classmethod
-    def get_mamba_specs_from_config(
-        cls, vllm_config: VllmConfig
-    ) -> tuple[MambaSpec, ...]:
-        """Return all MambaSpecs for this model (GDN layers + PLE layer).
-
-        The PLE layer uses a separate short_conv MambaSpec whose page_size_bytes
-        may exceed the GDN spec; callers should take the maximum.
-        """
-        return (
-            MambaSpec(
-                shapes=cls.get_gdn_mamba_state_shape_from_config(vllm_config),
-                dtypes=cls.get_gdn_mamba_state_dtype_from_config(vllm_config),
-                block_size=-1,
-            ),
-            MambaSpec(
-                shapes=cls.get_ple_mamba_state_shape_from_config(vllm_config),
-                dtypes=cls.get_ple_mamba_state_dtype_from_config(vllm_config),
-                block_size=-1,
-                tp_replicated=True,
-            ),
-        )
+        missing = mamba_types - copy_funcs.keys()
+        assert not missing, f"missing state copy funcs for {missing}"
+        return {kind: copy_funcs[kind] for kind in mamba_types}
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer
@@ -817,36 +724,41 @@ class Qwen4ExpForCausalLM(
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
+    @property
+    def checkpoint_mmap_weight_filter(self) -> Callable[[str], bool] | None:
+        if (
+            self.config.ple_layer_ids
+            and _resolve_ple_table_memory(self.vllm_config.additional_config) == "mmap"
+        ):
+            return _is_mmap_ple_weight
+        return None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={"mtp.": None}
-        )
         loader = AutoWeightsLoader(
             self,
-            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+            ignore_unexpected_suffixes=(
+                _QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy()
+            ),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
-class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
-    def get_hf_config(self) -> Qwen4ExpConfig:
-        return self.ctx.get_hf_config(Qwen4ExpConfig)
+class Qwen3_8FlashNextProcessingInfo(Qwen3VLProcessingInfo):
+    def get_hf_config(self) -> Qwen3_8FlashNextConfig:
+        return self.ctx.get_hf_config(Qwen3_8FlashNextConfig)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3VLMultiModalProcessor,
-    info=Qwen4ExpProcessingInfo,
+    info=Qwen3_8FlashNextProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
-class Qwen4ExpForConditionalGeneration(
+class Qwen3_8FlashNextForConditionalGeneration(
     Qwen3_5ForConditionalGeneration,
     HasInnerState,
-    Qwen4ExpMixtureOfExperts,
+    Qwen3_8FlashNextMixtureOfExperts,
 ):
-    """Qwen3-VL vision tower backed by the Qwen4Exp language model."""
-
     requires_raw_input_tokens = True
-
     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping | {
         "input_mix_weight_down_block_inject": [
             "input_mix_weight_down",
@@ -857,20 +769,16 @@ class Qwen4ExpForConditionalGeneration(
 
     @staticmethod
     def get_model_state_cls():
-        from .model_state import Qwen4ExpModelState
+        from .model_state import Qwen3_8FlashNextModelState
 
-        return Qwen4ExpModelState
+        return Qwen3_8FlashNextModelState
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model") -> None:
         nn.Module.__init__(self)
-        config: Qwen4ExpConfig = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
+        config: Qwen3_8FlashNextConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is None:
-            raise ValueError(
-                "Qwen4ExpForConditionalGeneration requires multimodal_config"
-            )
-
+            raise ValueError("Qwen3.8-Flash-Next requires multimodal_config")
         self.config = config
         self.model_config = vllm_config.model_config
         self.multimodal_config = multimodal_config
@@ -887,12 +795,11 @@ class Qwen4ExpForConditionalGeneration(
             self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
             self._init_video_pruning(multimodal_config)
             self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
-
             with self._mark_tower_model(vllm_config, {"image", "video"}):
                 self.visual = Qwen3_VisionTransformer(
                     config.vision_config,
                     norm_eps=config.text_config.rms_norm_eps,
-                    quant_config=quant_config,
+                    quant_config=vllm_config.quant_config,
                     prefix=maybe_prefix(prefix, "visual"),
                 )
 
@@ -908,7 +815,6 @@ class Qwen4ExpForConditionalGeneration(
         )
         self.visual_dim = config.vision_config.out_hidden_size
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
-
         if self.use_deepstack:
             self.deepstack_input_embeds = [
                 torch.zeros(
@@ -920,22 +826,18 @@ class Qwen4ExpForConditionalGeneration(
             self.deepstack_input_embeds_num_tokens = 0
 
         with self._mark_language_model(vllm_config):
-            self.language_model = Qwen4ExpForCausalLM(
+            self.language_model = Qwen3_8FlashNextForCausalLM(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "language_model"),
             )
-
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
-        if not get_pp_group().is_first_rank and self.use_deepstack:
-            assert self.language_model.model.start_layer >= len(
-                config.vision_config.deepstack_visual_indexes
-            ), (
-                "start_layer should be greater than or equal to "
-                "len(deepstack_visual_indexes)"
-            )
         self.set_moe_parameters(self.language_model.model.layers)
+
+    @property
+    def checkpoint_mmap_weight_filter(self) -> Callable[[str], bool] | None:
+        return self.language_model.checkpoint_mmap_weight_filter
 
     def embed_input_ids(
         self,
@@ -949,32 +851,26 @@ class Qwen4ExpForConditionalGeneration(
             self.language_model.embed_input_ids,
             is_multimodal=is_multimodal,
         )
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+        if not multimodal_embeddings:
             return inputs_embeds
         if self.language_model_only:
-            raise ValueError(
-                "Qwen4Exp language_model_only does not accept multimodal embeddings"
-            )
-
+            raise ValueError("language_model_only does not accept multimodal inputs")
         is_multimodal = _require_is_multimodal(is_multimodal)
         if self.use_deepstack:
-            deepstack_input_embeds, multimodal_embeddings = (
-                self._compute_deepstack_embeds(
-                    inputs_embeds=inputs_embeds,
-                    multimodal_embeddings=multimodal_embeddings,
-                    is_multimodal=is_multimodal,
-                )
+            deepstack, multimodal_embeddings = self._compute_deepstack_embeds(
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
             )
         else:
-            deepstack_input_embeds = None
-
+            deepstack = None
         inputs_embeds = _merge_multimodal_embeddings(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
         )
-        if deepstack_input_embeds is not None:
-            self._set_deepstack_input_embeds(deepstack_input_embeds)
+        if deepstack is not None:
+            self._set_deepstack_input_embeds(deepstack)
         return inputs_embeds
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
@@ -990,13 +886,13 @@ class Qwen4ExpForConditionalGeneration(
     ) -> torch.Tensor | IntermediateTensors:
         if intermediate_tensors is not None:
             inputs_embeds = None
-        if inputs_embeds is not None and get_pp_group().is_first_rank:
-            deepstack_input_embeds = self._get_deepstack_input_embeds(
-                inputs_embeds.size(0)
-            )
-        else:
-            deepstack_input_embeds = None
-
+        deepstack = (
+            self._get_deepstack_input_embeds(inputs_embeds.size(0))
+            if inputs_embeds is not None
+            and get_pp_group().is_first_rank
+            and self.use_deepstack
+            else None
+        )
         hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,
@@ -1004,62 +900,43 @@ class Qwen4ExpForConditionalGeneration(
             inputs_embeds=inputs_embeds,
             query_start_loc=kwargs.get("query_start_loc"),
             ngram_context=kwargs.get("ngram_context"),
-            deepstack_input_embeds=deepstack_input_embeds,
+            deepstack_input_embeds=deepstack,
         )
-        if inputs_embeds is not None and get_pp_group().is_first_rank:
+        if (
+            inputs_embeds is not None
+            and get_pp_group().is_first_rank
+            and self.use_deepstack
+        ):
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={"mtp.": None},
-            orig_to_new_prefix={"visual.": None} if self.language_model_only else {},
-        )
         loader = AutoWeightsLoader(
             self,
-            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+            ignore_unexpected_prefixes=(
+                ["visual."] if self.language_model_only else None
+            ),
+            ignore_unexpected_suffixes=(
+                _QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy()
+            ),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
-    @classmethod
-    def get_mamba_state_dtype_from_config(
-        cls,
-        vllm_config: VllmConfig,
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return Qwen4ExpForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
-
-    @classmethod
-    def get_mamba_state_shape_from_config(
-        cls,
-        vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        return Qwen4ExpForCausalLM.get_mamba_state_shape_from_config(vllm_config)
-
-    @classmethod
-    def get_mamba_state_copy_func(
-        cls,
-    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
-        return Qwen4ExpForCausalLM.get_mamba_state_copy_func()
-
-    @classmethod
-    def get_mamba_state_copy_funcs(
-        cls,
-        mamba_types: set[MambaAttentionBackendEnum],
-    ) -> MambaStateCopyFuncsByType:
-        return Qwen4ExpForCausalLM.get_mamba_state_copy_funcs(mamba_types)
-
-    @classmethod
-    def get_mamba_specs_from_config(
-        cls, vllm_config: VllmConfig
-    ) -> tuple[MambaSpec, ...]:
-        return Qwen4ExpForCausalLM.get_mamba_specs_from_config(vllm_config)
+    get_mamba_state_dtype_from_config = (
+        Qwen3_8FlashNextForCausalLM.get_mamba_state_dtype_from_config
+    )
+    get_mamba_state_shape_from_config = (
+        Qwen3_8FlashNextForCausalLM.get_mamba_state_shape_from_config
+    )
+    get_mamba_state_copy_func = Qwen3_8FlashNextForCausalLM.get_mamba_state_copy_func
+    get_mamba_state_copy_funcs = Qwen3_8FlashNextForCausalLM.get_mamba_state_copy_funcs
 
 
 __all__ = [
-    "Qwen4ExpDecoderLayer",
-    "Qwen4ExpForCausalLM",
-    "Qwen4ExpForConditionalGeneration",
-    "Qwen4ExpMixtureOfExperts",
-    "Qwen4ExpModel",
-    "Qwen4ExpSparseMoeBlock",
+    "Qwen3_8FlashNextDecoderLayer",
+    "Qwen3_8FlashNextForCausalLM",
+    "Qwen3_8FlashNextForConditionalGeneration",
+    "Qwen3_8FlashNextMixtureOfExperts",
+    "Qwen3_8FlashNextModel",
+    "Qwen3_8FlashNextSparseMoeBlock",
 ]
