@@ -233,8 +233,11 @@ class KVCacheSpec:
             f"Unsupported KV cache spec type: {type(self)}. "
             "Please register it using @register_kv_cache_spec decorator."
         )
+        dcp_replicated = getattr(self, "dcp_replicated", False)
         return all(
-            isinstance(spec, uniform_type_base_spec) for spec in kv_cache_specs.values()
+            isinstance(spec, uniform_type_base_spec)
+            and getattr(spec, "dcp_replicated", False) == dcp_replicated
+            for spec in kv_cache_specs.values()
         )
 
 
@@ -286,6 +289,8 @@ def compute_layout_strides(
     )
     order = layout.stride_order
     padded_page_size = getattr(spec, "page_size_padded", None)
+    if getattr(spec, "page_tail_bytes_per_token", 0):
+        padded_page_size = spec.page_size_bytes
     if padded_page_size is not None:
         assert kernel_block_size is None or kernel_block_size == spec.block_size, (
             "Padded KV pages do not support kernel block splitting."
@@ -393,6 +398,8 @@ class AttentionSpec(KVCacheSpec):
     """Tokens covered by one stored state. Ints > 1 compress multiple tokens
     into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
+    dcp_replicated: bool = False
+    """Whether every DCP rank stores the complete KV cache for this layer."""
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -431,7 +438,11 @@ class AttentionSpec(KVCacheSpec):
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         parallel_config = vllm_config.parallel_config
-        kv_shard_count = parallel_config.decode_context_parallel_size
+        kv_shard_count = (
+            1
+            if getattr(self, "dcp_replicated", False)
+            else parallel_config.decode_context_parallel_size
+        )
         return cdiv(max_len, self.block_size * kv_shard_count)
 
 
@@ -464,7 +475,7 @@ class FullAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        if dcp_world_size > 1:
+        if dcp_world_size > 1 and not self.dcp_replicated:
             max_model_len = cdiv(max_model_len, dcp_world_size)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
@@ -501,6 +512,11 @@ class FullAttentionSpec(AttentionSpec):
         assert not any(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "MLAAttentionSpec should be merged in MLAAttentionSpec.merge"
         )
+        dcp_replicated = {spec.dcp_replicated for spec in specs}
+        assert len(dcp_replicated) == 1, (
+            "All attention layers in one KV cache group must use the same "
+            "DCP replication mode."
+        )
         merged_spec = cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
@@ -517,6 +533,7 @@ class FullAttentionSpec(AttentionSpec):
             # If any layer in the group is non-causal, treat the group as
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
+            dcp_replicated=dcp_replicated.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -549,6 +566,8 @@ class MLAAttentionSpec(FullAttentionSpec):
     # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
+    page_tail_bytes_per_token: int = 0
+    """Opaque bytes appended after each MLA page for model-owned state."""
     # Marks draft groups that flatten a non-causal query block into decode rows.
     non_causal_multi_token_decode: bool = False
     # MLA stores a single latent vector per state; there is no separate V.
@@ -556,7 +575,15 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.page_tail_bytes_per_token < 0:
+            raise ValueError("page_tail_bytes_per_token must be non-negative")
         _apply_alignment_padding(self)
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            super().page_size_bytes + self.block_size * self.page_tail_bytes_per_token
+        )
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -566,13 +593,20 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        page_tail_bytes_per_token_set = set(
+            spec.page_tail_bytes_per_token for spec in specs
+        )
+        dcp_replicated_set = {spec.dcp_replicated for spec in specs}
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
+            and len(page_tail_bytes_per_token_set) == 1
+            and len(dcp_replicated_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, tokens per state, and model version."
+            "quantization method, tokens per state, model version, page tail, "
+            "and DCP replication mode."
         )
         non_causal_mtd_set = {spec.non_causal_multi_token_decode for spec in specs}
         assert len(non_causal_mtd_set) == 1, (
@@ -591,7 +625,11 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
-            non_causal_multi_token_decode=non_causal_mtd_set.pop(),
+            page_tail_bytes_per_token=page_tail_bytes_per_token_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
+            dcp_replicated=dcp_replicated_set.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -647,6 +685,7 @@ class RSWASpec(FullAttentionSpec):
             sliding_window=base.sliding_window,
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
+            dcp_replicated=base.dcp_replicated,
             rswa_window=rswa_windows.pop(),
         )
 
@@ -730,9 +769,10 @@ class SlidingWindowSpec(AttentionSpec):
         return cdiv(num_tokens, self.block_size) + 1
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
-            "DCP not support sliding window."
-        )
+        assert (
+            vllm_config.parallel_config.decode_context_parallel_size == 1
+            or self.dcp_replicated
+        ), "DCP only supports sliding-window KV when it is replicated."
         max_blocks = self.max_admission_blocks_per_request(
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             max_model_len=vllm_config.model_config.max_model_len,
@@ -745,6 +785,7 @@ class SlidingWindowSpec(AttentionSpec):
         return all(
             isinstance(spec, SlidingWindowSpec)
             and spec.sliding_window == self.sliding_window
+            and spec.dcp_replicated == self.dcp_replicated
             for spec in kv_cache_specs.values()
         )
 
@@ -811,16 +852,18 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
+        dcp_replicated_set = {spec.dcp_replicated for spec in specs}
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
             and len(extra_retained_set) == 1
+            and len(dcp_replicated_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
-            "window size, and retained token count."
+            "window size, retained token count, and DCP replication mode."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -835,6 +878,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
+            dcp_replicated=dcp_replicated_set.pop(),
         )
 
     def is_uniform_with_collection(
@@ -843,6 +887,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         return all(
             isinstance(spec, SlidingWindowMLASpec)
             and spec.sliding_window == self.sliding_window
+            and spec.dcp_replicated == self.dcp_replicated
             for spec in kv_cache_specs.values()
         )
 
@@ -963,6 +1008,11 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         assert not any(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "MLAAttentionSpec should be merged in MLAAttentionSpec.merge"
         )
+        dcp_replicated = {spec.dcp_replicated for spec in specs}
+        assert len(dcp_replicated) == 1, (
+            "All attention layers in one KV cache group must use the same "
+            "DCP replication mode."
+        )
         merged_spec = cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
@@ -977,6 +1027,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             non_causal=any(spec.non_causal for spec in specs),
+            dcp_replicated=dcp_replicated.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -1016,6 +1067,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+    @property
+    def dcp_replicated(self) -> bool:
+        return all(
+            getattr(spec, "dcp_replicated", False)
+            for spec in self.kv_cache_specs.values()
+        )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(

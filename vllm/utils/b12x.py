@@ -7,9 +7,11 @@ import importlib.util
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass, fields, is_dataclass
 from types import ModuleType
-from typing import Any
+from typing import Any, Literal
 
 import torch
+
+import vllm.envs as envs
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,12 @@ class B12xWarmupUnit:
     name: str
     key: Hashable
     compile: Callable[[], None]
+
+
+def get_b12x_dense_activation_mode(recipe: Literal["nvfp4", "mxfp8"]) -> str:
+    """Resolve the dense precision override once when loading a layer."""
+    override = getattr(envs, f"VLLM_B12X_{recipe.upper()}_ACTIVATION_MODE")
+    return override if override is not None else envs.VLLM_B12X_DENSE_ACTIVATION_MODE
 
 
 _HAS_B12X = importlib.util.find_spec("b12x") is not None
@@ -34,12 +42,28 @@ def _import_submodule(module_name: str) -> ModuleType | None:
 _B12X_SUBMODULES = {
     module_name: _import_submodule(module_name)
     for module_name in (
+        "b12x.attention.paged",
+        "b12x.attention.sparse_mla",
+        "b12x.attention.compressed_sparse_mla",
+        "b12x.attention.dsa_indexer",
+        "b12x.attention.qsa",
+        "b12x.gemm.bf16_vocab_projection",
         "b12x.gemm.blockscaled",
+        "b12x.gemm.mla_query_projection",
+        "b12x.gemm.wo_projection",
+        "b12x.norm.mhc",
         # TODO: Remove once B12X exposes the scale-swizzle API publicly.
         "b12x._lib.intrinsics",
         "b12x.gemm.mxfp8_linear",
         "b12x.gemm.tensor_fp8_linear",
         "b12x.moe.fused_moe",
+        "b12x.norm.hyperconnection",
+        "b12x.sequence.gdn_decode",
+        "b12x.sequence.kda_prefill",
+        "b12x.sequence.mtp_feedback",
+        "b12x.sequence.ple",
+        "b12x.sequence.ple_embedding",
+        "b12x.sequence.ple_hash",
     )
 }
 
@@ -55,6 +79,34 @@ def _get_submodule(module_name: str) -> ModuleType | None:
 
 def get_b12x_blockscaled() -> ModuleType | None:
     return _get_submodule("b12x.gemm.blockscaled")
+
+
+def get_b12x_bf16_vocab_projection() -> ModuleType | None:
+    return _get_submodule("b12x.gemm.bf16_vocab_projection")
+
+
+def get_b12x_mla_query_projection() -> ModuleType | None:
+    return _get_submodule("b12x.gemm.mla_query_projection")
+
+
+def get_b12x_wo_projection() -> ModuleType | None:
+    return _get_submodule("b12x.gemm.wo_projection")
+
+
+def get_b12x_mhc() -> ModuleType | None:
+    return _get_submodule("b12x.norm.mhc")
+
+
+def get_b12x_compressed_sparse_mla() -> ModuleType | None:
+    return _get_submodule("b12x.attention.compressed_sparse_mla")
+
+
+def get_b12x_sparse_mla() -> ModuleType | None:
+    return _get_submodule("b12x.attention.sparse_mla")
+
+
+def get_b12x_dsa_indexer() -> ModuleType | None:
+    return _get_submodule("b12x.attention.dsa_indexer")
 
 
 def get_b12x_intrinsics() -> ModuleType | None:
@@ -73,6 +125,42 @@ def get_b12x_fused_moe() -> ModuleType | None:
     return _get_submodule("b12x.moe.fused_moe")
 
 
+def get_b12x_paged_attention() -> ModuleType | None:
+    return _get_submodule("b12x.attention.paged")
+
+
+def get_b12x_qsa() -> ModuleType | None:
+    return _get_submodule("b12x.attention.qsa")
+
+
+def get_b12x_hyperconnection() -> ModuleType | None:
+    return _get_submodule("b12x.norm.hyperconnection")
+
+
+def get_b12x_gdn_decode() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.gdn_decode")
+
+
+def get_b12x_kda_prefill() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.kda_prefill")
+
+
+def get_b12x_mtp_feedback() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.mtp_feedback")
+
+
+def get_b12x_ple() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.ple")
+
+
+def get_b12x_ple_embedding() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.ple_embedding")
+
+
+def get_b12x_ple_hash() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.ple_hash")
+
+
 def b12x_warmup_token_counts(
     *,
     max_tokens: int,
@@ -86,6 +174,26 @@ def b12x_warmup_token_counts(
     if int(max_tokens) > 0:
         counts.add(int(max_tokens))
     return tuple(sorted(counts))
+
+
+def get_b12x_scratch_buffers(plan: Any) -> list[torch.Tensor]:
+    """Return caller-owned scratch buffers for a planned b12x operation."""
+    specs = tuple(plan.scratch_specs())
+    if not specs:
+        return []
+
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    if is_workspace_manager_initialized():
+        return current_workspace_manager().get_simultaneous(
+            *((spec.shape, spec.dtype) for spec in specs)
+        )
+    return [
+        torch.empty(spec.shape, dtype=spec.dtype, device=spec.device) for spec in specs
+    ]
 
 
 def _same_packed_layout(current: Any, replacement: Any) -> bool:

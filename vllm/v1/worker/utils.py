@@ -641,6 +641,24 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 layer.impl._k_scale_cache = None
             if hasattr(layer.impl, "_v_scale_cache"):
                 layer.impl._v_scale_cache = None
+def unbind_kv_cache(forward_context: dict[str, Any]) -> None:
+    """Release cache references retained by attention-like layers."""
+    for layer in forward_context.values():
+        unbind = getattr(layer, "unbind_kv_cache", None)
+        if callable(unbind):
+            unbind()
+        elif hasattr(layer, "kv_cache"):
+            kv_cache = layer.kv_cache
+            layer.kv_cache = (
+                torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+            )
+
+        impl = getattr(layer, "impl", None)
+        if impl is not None:
+            if hasattr(impl, "_k_scale_cache"):
+                impl._k_scale_cache = None
+            if hasattr(impl, "_v_scale_cache"):
+                impl._v_scale_cache = None
 
 
 def copy_kv_cache_blocks_inplace(

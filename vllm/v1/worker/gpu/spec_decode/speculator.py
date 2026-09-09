@@ -45,6 +45,10 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
 
 
 class BaseSpeculator(ABC):
+    def reset_attn(self) -> None:
+        """Release objects derived from a target KV-cache allocation."""
+        return None
+
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
@@ -76,6 +80,8 @@ class BaseSpeculator(ABC):
         # [max_num_reqs]
         seeds: torch.Tensor,
         dp_sync: DPSyncState | None = None,
+        num_speculative_tokens: int | None = None,
+        num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
@@ -206,6 +212,13 @@ class DraftModelSpeculator(BaseSpeculator):
                 type(self.model).__name__,
             )
 
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.max_model_len = int(max_model_len)
+        self.draft_max_seq_len = self.max_model_len
+        update_model_len = getattr(self.model, "update_max_model_len", None)
+        if update_model_len is not None:
+            update_model_len(self.max_model_len)
+
     def set_eplb_state(self, eplb_state: EplbState) -> None:
         """Inject EPLB state after construction."""
         self.eplb_state = eplb_state
@@ -248,6 +261,27 @@ class DraftModelSpeculator(BaseSpeculator):
         self.target_input_buffers = target_input_buffers
         self.target_attn_groups = target_attn_groups
 
+    def reset_attn(self) -> None:
+        """Release attention builders, tables, and graphs created by set_attn."""
+        for name in (
+            "model_state",
+            "kv_cache_config",
+            "attn_groups",
+            "attn_cg_support",
+            "block_tables",
+            "target_attn_groups",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
+        for name in (
+            "prefill_cudagraph_manager",
+            "decode_cudagraph_manager",
+            "cudagraph_manager",
+            "query_cudagraph_manager",
+        ):
+            if hasattr(self, name):
+                setattr(self, name, None)
+
     def _build_draft_attn_metadata(
         self,
         num_reqs: int,
@@ -260,6 +294,16 @@ class DraftModelSpeculator(BaseSpeculator):
         query_start_loc_np: np.ndarray | None = None,
         dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
+        if dcp_local_seq_lens is None and getattr(self.block_tables, "cp_size", 1) > 1:
+            prepare_dcp_local_seq_lens(
+                self.input_buffers.dcp_local_seq_lens,
+                self.input_buffers.seq_lens,
+                num_reqs,
+                self.block_tables.cp_size,
+                self.block_tables.cp_rank,
+                self.block_tables.cp_interleave,
+            )
+            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
         if query_start_loc_np is not None:
             # Non-uniform query layout (e.g. multi-module MTP's mixed
             # prefill/decode queries); num_query_per_req is ignored.
@@ -305,6 +349,12 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.block_tables.cp_interleave,
             )
             dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
+        model_specific_attn_metadata = self.model_state.prepare_draft_attn_metadata(
+            idx_mapping=self.idx_mapping,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            draft_index=step,
+        )
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs_padded,
@@ -326,6 +376,7 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+            model_specific_attn_metadata=model_specific_attn_metadata,
         )
         return attn_metadata
 

@@ -42,6 +42,10 @@ class MambaBase(AttentionLayerBase):
             offset += nbytes
         self.kv_cache = tuple(states)
 
+    def unbind_kv_cache(self) -> None:
+        """Release unpacked state views derived from the raw cache page."""
+        self.kv_cache = ()
+
     @abstractmethod
     def get_state_shape(self) -> Iterable[tuple[int, ...]]:
         """

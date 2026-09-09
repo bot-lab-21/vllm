@@ -8,6 +8,34 @@ from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
+def limit_draft_tokens(
+    draft_tokens: torch.Tensor,
+    num_speculative_tokens: int,
+    max_num_speculative_tokens: int,
+) -> torch.Tensor:
+    """Limit a speculator's output to the scheduler-selected depth."""
+    if draft_tokens.ndim != 2:
+        raise RuntimeError(
+            "Speculator returned unsupported draft shape "
+            f"{tuple(draft_tokens.shape)}; expected a 2D tensor."
+        )
+    if not 1 <= num_speculative_tokens <= max_num_speculative_tokens:
+        raise RuntimeError(
+            "Scheduler selected an invalid speculative-token count "
+            f"{num_speculative_tokens}; expected a value between 1 and "
+            f"{max_num_speculative_tokens}."
+        )
+    if draft_tokens.shape[1] == 0:
+        return draft_tokens
+    if draft_tokens.shape[1] < num_speculative_tokens:
+        raise RuntimeError(
+            "Speculator returned too few draft tokens "
+            f"({draft_tokens.shape[1]}); expected at least "
+            f"{num_speculative_tokens}."
+        )
+    return draft_tokens[:, :num_speculative_tokens]
+
+
 class DraftTokensHandler:
     def __init__(self, device: torch.device | None = None):
         self.device = device

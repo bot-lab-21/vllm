@@ -25,7 +25,6 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
-    mhc_post_tilelang,
 )
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -43,6 +42,11 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.weight_transfer import (
+    allocate_weights,
+    copy_weight,
+    flush_weight_transfers,
+)
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -119,14 +123,15 @@ class DSparkDeepseekV4Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         hc_dim = self.hc_mult * config.hidden_size
         self.hc_head_fn = nn.Parameter(
-            torch.empty(self.hc_mult, hc_dim, dtype=torch.float32),
+            allocate_weights(torch.empty, self.hc_mult, hc_dim, dtype=torch.float32),
             requires_grad=False,
         )
         self.hc_head_base = nn.Parameter(
-            torch.empty(self.hc_mult, dtype=torch.float32), requires_grad=False
+            allocate_weights(torch.empty, self.hc_mult, dtype=torch.float32),
+            requires_grad=False,
         )
         self.hc_head_scale = nn.Parameter(
-            torch.empty(1, dtype=torch.float32), requires_grad=False
+            allocate_weights(torch.empty, 1, dtype=torch.float32), requires_grad=False
         )
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
@@ -153,6 +158,20 @@ class DSparkDeepseekV4Model(nn.Module):
         ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
         """
         return self.main_norm(self.main_proj(aux_hidden_states))
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        first_layer = self.layers[0]
+        if not first_layer.uses_b12x_mhc:
+            return
+        broadcast = (
+            first_layer.hc_attn_fn.detach()
+            .view(-1, first_layer.hc_mult, first_layer.hidden_size)
+            .sum(dim=1)
+        )
+        if first_layer.hc_attn_fn_broadcast is None:
+            first_layer.hc_attn_fn_broadcast = broadcast
+        else:
+            first_layer.hc_attn_fn_broadcast.copy_(broadcast)
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(
@@ -204,8 +223,10 @@ class DSparkDeepseekV4Model(nn.Module):
                 )
             inputs_embeds = sp_shard(inputs_embeds)
             input_ids = sp_shard(input_ids)
-        # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        if self.layers[0].uses_b12x_mhc:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
@@ -217,7 +238,9 @@ class DSparkDeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        hidden_states = self.layers[-1].mhc_post(
+            hidden_states, residual, post_mix, res_mix
+        )
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         # hc_head reduces the hc copies; return the PRE-norm head hidden
@@ -300,6 +323,7 @@ def _insert_context_kv(
 
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
+    model_cls = DSparkDeepseekV4Model
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
     # load_dspark_model always aliases the target's.
     has_own_embed_tokens = False
@@ -316,7 +340,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self.pad_shared_expert = getattr(
             self.quant_config, "weight_block_size", None
         ) is not None and not _use_sequence_parallel(vllm_config)
-        self.model = DSparkDeepseekV4Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         # Shared with the target (aliased by the speculator's load utility).
@@ -492,7 +516,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             else:
                 if "attn_sink" in name:
                     narrow = loaded_weight[head_start:head_end]
-                    params_dict[name][: narrow.shape[0]].copy_(narrow)
+                    copy_weight(params_dict[name][: narrow.shape[0]], narrow)
                     loaded_params.add(name)
                     continue
                 if name.endswith(".ffn.gate.bias"):
@@ -515,7 +539,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             layer.ffn.finalize_mega_moe_weights()
 
     def process_weights_after_loading(self) -> None:
+        flush_weight_transfers()
         self._finalize_moe()
+        self.model.finalize_mhc_broadcast_weights()
+        for layer in self.model.layers:
+            layer.process_b12x_weights_after_loading()
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.

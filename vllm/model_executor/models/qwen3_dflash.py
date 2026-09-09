@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import dataclasses
 import io
 from collections.abc import Iterable
 
@@ -35,6 +36,12 @@ from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+    get_kv_quant_mode,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -149,6 +156,36 @@ def _resolve_layer_attention(
     return sliding_window, _dflash_layer_causal(config, layer_idx)
 
 
+class DFlashAttention(Attention):
+    """Attention whose small draft KV is replicated across DCP ranks."""
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        dcp_replicated = vllm_config.parallel_config.decode_context_parallel_size > 1
+        if self.sliding_window is not None:
+            assert self.attn_type == AttentionType.DECODER
+            return SlidingWindowSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                sliding_window=self.sliding_window,
+                page_size_padded=getattr(
+                    vllm_config.cache_config, "skip_page_size_padded", None
+                ),
+                # Prefix lookup verifies one lookahead block and then drops it.
+                # Keep one additional local window alive during chunked prefill
+                # so the proof block is not recycled before it can be hashed.
+                extra_retained_tokens=self.sliding_window,
+                kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+                dcp_replicated=dcp_replicated,
+            )
+        spec = super().get_kv_cache_spec(vllm_config)
+        if dcp_replicated and isinstance(spec, FullAttentionSpec):
+            spec = dataclasses.replace(spec, dcp_replicated=True)
+        return spec
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -224,7 +261,7 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
-        self.attn = Attention(
+        self.attn = DFlashAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -452,6 +489,14 @@ class DFlashQwen3Model(nn.Module):
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
         )
+        # The context projection concatenates K/V weights from every draft
+        # layer. It is not a LinearBase module because its output layout is a
+        # DFlash-specific fusion. Serialized MXFP8 checkpoints retain an
+        # independently packed copy in this parameter container.
+        self._fused_kv_linear = nn.Module()
+        self._fused_kv_quant_method = None
+        self._fused_kv_weight: torch.Tensor | None = None
+        self._fused_kv_weight_scale: torch.Tensor | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         embeds = self.embed_tokens(input_ids)
@@ -466,11 +511,31 @@ class DFlashQwen3Model(nn.Module):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8LinearMethod,
+        )
+
+        quant_methods = [a.qkv_proj.quant_method for a in layers_attn]
+        uses_mxfp8 = [
+            isinstance(method, ModelOptMxFp8LinearMethod) for method in quant_methods
+        ]
+        if any(uses_mxfp8) and not all(uses_mxfp8):
+            raise ValueError(
+                "Every DFlash attention layer must use the same MXFP8 "
+                "linear format for the fused context K/V projection."
+            )
+
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
         kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+
+        if all(uses_mxfp8):
+            kv_scales = [a.qkv_proj.weight_scale[a.q_size :] for a in layers_attn]
+            self._fused_kv_weight_scale = torch.cat(kv_scales, dim=0)
+        else:
+            self._fused_kv_weight_scale = None
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
             self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
@@ -526,6 +591,41 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
+    def process_weights_after_loading(self) -> None:
+        """Pack the serialized MXFP8 context projection for its GEMM backend."""
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8LinearMethod,
+        )
+
+        quant_method = self.layers[0].self_attn.qkv_proj.quant_method
+        if not isinstance(quant_method, ModelOptMxFp8LinearMethod):
+            return
+        if self._fused_kv_weight is None or self._fused_kv_weight_scale is None:
+            raise RuntimeError(
+                "The DFlash MXFP8 context projection requires serialized K/V "
+                "weights and block scales to be fused during checkpoint loading."
+            )
+
+        output_size, input_size = self._fused_kv_weight.shape
+        self._fused_kv_linear.input_size_per_partition = input_size
+        self._fused_kv_linear.output_size_per_partition = output_size
+        self._fused_kv_linear.logical_widths = [output_size]
+        self._fused_kv_linear.register_parameter(
+            "weight", nn.Parameter(self._fused_kv_weight, requires_grad=False)
+        )
+        self._fused_kv_linear.register_parameter(
+            "weight_scale",
+            nn.Parameter(self._fused_kv_weight_scale, requires_grad=False),
+        )
+        quant_method.process_weights_after_loading(self._fused_kv_linear)
+        self._fused_kv_quant_method = quant_method
+        self._fused_kv_weight = None
+        self._fused_kv_weight_scale = None
+        logger.info_once(
+            "Using %s for the fused DFlash context K/V projection.",
+            type(quant_method.kernel).__name__,
+        )
+
     def _project_context_kv(
         self,
         context_states: torch.Tensor,
@@ -542,9 +642,18 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
+        if self._fused_kv_quant_method is None:
+            if self._fused_kv_weight is None:
+                raise RuntimeError("DFlash context K/V projection is not initialized.")
+            all_kv_flat = F.linear(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
+        else:
+            all_kv_flat = self._fused_kv_quant_method.apply(
+                self._fused_kv_linear,
+                normed_context_states,
+                self._fused_kv_bias,
+            )
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
@@ -772,6 +881,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.model.precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mapping
         )
+
+    def process_weights_after_loading(self) -> None:
+        """Finalize the DFlash fused context projection after linear packing."""
+        self.model.process_weights_after_loading()
 
     def combine_hidden_states(
         self,

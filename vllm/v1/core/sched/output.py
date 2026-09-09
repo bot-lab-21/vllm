@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.core.sched.compute_fairness import ComputeServiceClass
 
 if TYPE_CHECKING:
     import numpy as np
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
 else:
@@ -30,6 +32,7 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+    BoundaryCheckpoint = object
 
 
 @dataclass
@@ -47,6 +50,9 @@ class NewRequestData:
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+    boundary_checkpoint: BoundaryCheckpoint | None = None
+    boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
+    recurrent_instruction_boundary: int | None = None
 
     @classmethod
     def from_request(
@@ -74,6 +80,9 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            boundary_checkpoint=request.boundary_checkpoint,
+            boundary_checkpoint_blocks=request.boundary_checkpoint_blocks,
+            recurrent_instruction_boundary=request.recurrent_instruction_boundary,
         )
 
     @property
@@ -207,11 +216,9 @@ class ScheduledEncoderInputStats:
 
 @dataclass
 class KVConnectorBlockState:
-    """Scheduler-local block state offered to a producer-side KV connector."""
+    """Scheduler-local current tables and exact retained-state offers."""
 
-    # Authoritative current block-table snapshots.
     block_ids: dict[str, tuple[list[int], ...]]
-    # Exact Mamba "align" boundary-state hand-offs.
     boundary_state_offloads: dict[str, list[tuple[int, int, int]]]
 
 
@@ -253,6 +260,8 @@ class SchedulerOutput:
     free_encoder_mm_hashes: list[str]
 
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
+    # This batch samples saved final hidden states without a target forward.
+    boundary_logits_only: bool = False
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
@@ -293,7 +302,12 @@ class SchedulerOutput:
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
-    num_spec_tokens_to_schedule: int = 0
+    num_spec_tokens_to_schedule: int | None = None
+
+    # Explicit model-execution class used by adaptive compute fairness.
+    # None identifies a transfer-only or otherwise empty model step.
+    compute_service_class: ComputeServiceClass | None = None
+    compute_contention: bool = False
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
@@ -308,6 +322,12 @@ class SchedulerOutput:
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
         )
+
+    def resolve_num_spec_tokens_to_schedule(self, default: int) -> int:
+        """Resolve the speculative depth for real and synthetic outputs."""
+        if self.num_spec_tokens_to_schedule is None:
+            return default
+        return self.num_spec_tokens_to_schedule
 
 
 @dataclass

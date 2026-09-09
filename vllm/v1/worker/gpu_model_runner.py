@@ -248,6 +248,7 @@ from .utils import (
     copy_kv_cache_blocks_inplace,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
+    unbind_kv_cache,
 )
 
 if TYPE_CHECKING:
@@ -1012,6 +1013,11 @@ class GPUModelRunner(
             draft_config = self.speculative_config.draft_model_config
             if draft_config is None or draft_config.max_model_len is None:
                 self.effective_drafter_max_model_len = self.max_model_len
+        update_model_len = getattr(
+            getattr(self, "model", None), "update_max_model_len", None
+        )
+        if update_model_len is not None:
+            update_model_len(max_model_len)
 
     def reset_mm_cache(self) -> None:
         """
@@ -1070,6 +1076,9 @@ class GPUModelRunner(
         # decode + hybrid model.
         assert self.cache_config.mamba_cache_mode == "align"
         if self._mamba_bufs is None:
+            copy_funcs = mamba_utils.resolve_mamba_state_copy_funcs(
+                self.model, self.kv_cache_config
+            )
             self._mamba_bufs = mamba_utils.MambaBuffers.create(
                 max_num_reqs=self.max_num_reqs,
                 kv_cache_config=self.kv_cache_config,
@@ -2428,6 +2437,16 @@ class GPUModelRunner(
             _bidi_sw = getattr(hf_text_config, "sliding_window", None)
             _clamps_in_kernel = getattr(
                 self.model, "mm_prefix_clamp_sliding_window", False
+            ) or getattr(hf_text_config, "mm_prefix_clamp_sliding_window", False)
+            # Some models (DeepSeek-V4 vision) define the bidirectional span
+            # over the whole sentinel block ([IMAGE_START, IMAGE_END]) rather
+            # than the embed tokens, and prepend a position-dependent
+            # alignment pad before the first sentinel. For those, derive the
+            # span from the full placeholder range and strip the pad.
+            # TODO(Isotr0py): Refactor mm_prefix_lm implementation
+            # for better readability and maintainability.
+            _span_pad_modulus = getattr(
+                hf_text_config, "mm_prefix_span_leading_pad_modulus", 0
             )
             for req_id in self.input_batch.req_ids:
                 image_doc_ranges = []
@@ -2436,7 +2455,18 @@ class GPUModelRunner(
                     if mm_feature.modality == "audio":
                         continue
                     pos_info = mm_feature.mm_position
-                    img_doc_range = pos_info.extract_embeds_range()
+                    if _span_pad_modulus:
+                        pad = (
+                            _span_pad_modulus - 1 - pos_info.offset % _span_pad_modulus
+                        )
+                        img_doc_range = [
+                            (
+                                pos_info.offset + pad,
+                                pos_info.offset + pos_info.length - 1,
+                            )
+                        ]
+                    else:
+                        img_doc_range = pos_info.extract_embeds_range()
                     for r in img_doc_range:
                         if (
                             not _clamps_in_kernel
@@ -5093,7 +5123,9 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
-        num_spec_tokens_to_schedule = scheduler_output.num_spec_tokens_to_schedule
+        num_spec_tokens_to_schedule = (
+            scheduler_output.resolve_num_spec_tokens_to_schedule(self.num_spec_tokens)
+        )
         self._draft_probs = None
         self._draft_prob_req_ids = None
         if spec_config.method == "ngram":
@@ -5908,6 +5940,7 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         randomize_inputs: bool = False,
+        single_request_prefill: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5935,6 +5968,10 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            single_request_prefill: If True, place the complete token budget in
+                one prefill request. This exposes attention and collective
+                workspace peaks that are hidden when the ordinary profile
+                distributes the same token budget across many requests.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -5967,7 +6004,13 @@ class GPUModelRunner(
         # has num_tokens in total.
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
+        if single_request_prefill:
+            assert not create_mixed_batch
+            assert not uniform_decode
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
+            max_query_len = num_tokens
+        elif create_mixed_batch:
             assert not uniform_decode
             # Create mixed batch:
             # first half decode tokens, second half one prefill
@@ -6042,6 +6085,7 @@ class GPUModelRunner(
             create_mixed_batch,
             is_graph_capturing,
             uniform_decode,
+            single_request_prefill,
         )
         ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
             should_ubatch,
@@ -6586,6 +6630,39 @@ class GPUModelRunner(
         self.encoder_cache.clear()
         gc.collect()
 
+    @torch.inference_mode()
+    def profile_glm_dcp_attention(self) -> None:
+        """Profile GLM split-cache DCP attention before KV cache sizing.
+
+        The generic activation profile omits attention metadata and spreads the
+        scheduler token budget across many requests. GLM sparse MLA can instead
+        receive one full prefill quantum and gather its query heads across the
+        decode-context-parallel group. A minimal temporary cache makes that
+        backend path reachable without reserving production KV storage.
+        """
+        if (
+            self.model_config.architecture != "Glm5NextForConditionalGeneration"
+            or self.dcp_world_size <= 1
+        ):
+            return
+
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling()
+
+        model_output: tuple[torch.Tensor, torch.Tensor] | None = None
+        try:
+            model_output = self._dummy_run(
+                self.max_num_tokens,
+                force_attention=True,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+            )
+            self._sync_device()
+        finally:
+            del model_output
+            self._cleanup_profiling_kv_cache()
+
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_config_from_groups,
@@ -6604,10 +6681,12 @@ class GPUModelRunner(
         # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
         saved_override = self.cache_config.num_gpu_blocks_override
         self.cache_config.num_gpu_blocks_override = min_blocks
-        minimal_config = get_kv_cache_config_from_groups(
-            self.vllm_config, kv_cache_groups, available_memory=0
-        )
-        self.cache_config.num_gpu_blocks_override = saved_override
+        try:
+            minimal_config = get_kv_cache_config_from_groups(
+                self.vllm_config, kv_cache_groups, available_memory=0
+            )
+        finally:
+            self.cache_config.num_gpu_blocks_override = saved_override
 
         self.initialize_kv_cache(minimal_config, is_profiling=True)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks
@@ -6670,23 +6749,14 @@ class GPUModelRunner(
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
+        if hasattr(self, "drafter") and hasattr(self.drafter, "draft_attn_groups"):
+            self.drafter.draft_attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
             delattr(self, "kv_cache_config")
         self.cache_config.num_gpu_blocks = None
 
-        for layer in self.compilation_config.static_forward_context.values():
-            if hasattr(layer, "kv_cache"):
-                kv_cache = layer.kv_cache
-                layer.kv_cache = (
-                    torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
-                )
-            # Clean up quantized KV cache scale views
-            # (int8_per_token_head, fp8_per_token_head)
-            if hasattr(layer, "impl"):
-                if hasattr(layer.impl, "_k_scale_cache"):
-                    layer.impl._k_scale_cache = None
-                if hasattr(layer.impl, "_v_scale_cache"):
-                    layer.impl._v_scale_cache = None
+        unbind_kv_cache(self.compilation_config.static_forward_context)
+        self._mamba_bufs = None
 
         gc.collect()
         torch.accelerator.empty_cache()
@@ -6731,8 +6801,14 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
-        with set_current_vllm_config(self.vllm_config):
-            self._init_minimal_kv_cache_for_profiling()
+        profiling_state_initialized = False
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                self._init_minimal_kv_cache_for_profiling()
+            profiling_state_initialized = True
+        finally:
+            if not profiling_state_initialized:
+                self._cleanup_profiling_kv_cache()
 
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
 

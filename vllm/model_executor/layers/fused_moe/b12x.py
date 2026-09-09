@@ -42,7 +42,7 @@ _B12X_MOE_MODES: dict[
     ("mxfp4", None): ("w4a16", "fp4_e8m0_k32", "w31"),
     ("nvfp4", "nvfp4"): ("nvfp4", "modelopt_nvfp4", "w31"),
     ("nvfp4", "mxfp8"): ("w4a8_nvfp4", "modelopt_nvfp4", "w31"),
-    ("nvfp4", None): ("w4a16", "modelopt_nvfp4", "w13"),
+    ("nvfp4", None): ("w4a16", "modelopt_nvfp4", "w31"),
 }
 
 
@@ -189,14 +189,6 @@ def _normalize_expert_scale(scale: torch.Tensor) -> torch.Tensor:
     return scale.to(dtype=torch.float32).contiguous()
 
 
-def _canonicalize_fp4_zero_signs_(packed: torch.Tensor) -> None:
-    """Clear sign bits from packed FP4 zero values in place."""
-    packed = packed.view(torch.uint8)
-    magnitude = packed & 0x77
-    nonzero = (magnitude | (magnitude >> 1) | (magnitude >> 2)) & 0x11
-    packed.bitwise_and_(0x77 | (nonzero << 3))
-
-
 class B12xExperts(mk.FusedMoEExpertsModular):
     """FP4 MoE experts backed by the b12x SM12x planned API."""
 
@@ -227,6 +219,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._source_parameters_released = False
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
         self._plans: dict[tuple[int, int, MoEActivation, bool], Any] = {}
+        self._prefill_capacity = max(int(moe_config.max_num_tokens), 1)
+        self._plan_capacities = {1, self._prefill_capacity}
         self._apply_router_weight_on_input = False
 
     def _unit_scale(self, device: torch.device, num_experts: int) -> torch.Tensor:
@@ -295,9 +289,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         if self.w1_scale is None or self.w2_scale is None:
             raise ValueError("b12x MoE requires w1 and w2 block scales")
-
-        _canonicalize_fp4_zero_signs_(w1)
-        _canonicalize_fp4_zero_signs_(w2)
 
         fused_moe = _require_b12x_fused_moe()
 
@@ -523,6 +514,24 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         return self._prepared_experts
 
+    def _register_plan_capacities(self, token_counts: Iterable[int]) -> None:
+        capacities = {int(count) for count in token_counts if int(count) > 0}
+        self._plan_capacities.update(capacities)
+        if capacities:
+            self._prefill_capacity = max(self._prefill_capacity, max(capacities))
+            self._plan_capacities.add(self._prefill_capacity)
+
+    def _plan_capacity(self, tokens: int) -> int:
+        tokens = max(int(tokens), 1)
+        if tokens > self._prefill_capacity:
+            raise ValueError(
+                f"live MoE token count {tokens} exceeds the configured prefill "
+                f"capacity {self._prefill_capacity}"
+            )
+        if tokens in self._plan_capacities:
+            return tokens
+        return self._prefill_capacity
+
     def moe_problem_size(
         self,
         a1: torch.Tensor,
@@ -551,9 +560,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool = False,
     ) -> Any:
         fused_moe = _require_b12x_fused_moe()
+        capacity = self._plan_capacity(tokens)
 
         key = (
-            max(int(tokens), 1),
+            capacity,
             int(topk),
             activation,
             bool(apply_router_weight_on_input),
@@ -592,6 +602,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         output_dtype: torch.dtype,
     ) -> B12xWarmupUnit:
         assert output_dtype == self.moe_config.in_dtype
+        self._register_plan_capacities(token_counts)
         prepared = self._prepared()
         activation = layer.activation
         limit, alpha, beta = self._swiglu_params(activation)
@@ -629,6 +640,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         token_counts: Iterable[int],
     ) -> int:
         """Compile one representative launch for every planned regime."""
+        token_counts = tuple(int(count) for count in token_counts if int(count) > 0)
+        self._register_plan_capacities(token_counts)
         activation = layer.activation
         dtype = self.moe_config.in_dtype
         topk = int(self.moe_config.experts_per_token)
@@ -637,7 +650,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         prepared = self._prepared()
         device = prepared.w1_fp4.device
         launch_tokens: dict[tuple[Any, ...], int] = {}
-        for tokens in sorted({int(count) for count in token_counts if int(count) > 0}):
+        for tokens in sorted(set(token_counts)):
             execution_plan = _b12x_moe_execution_plan(
                 tokens=tokens,
                 topk=topk,
@@ -651,47 +664,58 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             signature = (execution_plan.implementation, execution_plan.execution)
             launch_tokens.setdefault(signature, tokens)
 
+        launch_resources: list[tuple[torch.Tensor, ...]] = []
         for tokens in launch_tokens.values():
-            hidden_states = torch.zeros(
-                (tokens, int(prepared.hidden_size)),
-                dtype=dtype,
-                device=device,
-            )
-            output = torch.empty_like(hidden_states)
-            topk_ids = (
-                torch.arange(topk, device=device, dtype=torch.int32)
-                .unsqueeze(0)
-                .expand(tokens, -1)
-                .contiguous()
-            )
-            topk_ids.remainder_(int(prepared.num_experts))
-            topk_weights = torch.full(
-                (tokens, topk),
-                1.0 / topk,
-                dtype=torch.float32,
-                device=device,
-            )
             plan = self._plan(
                 tokens=tokens,
                 topk=topk,
                 activation=activation,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
-            scratch = torch.empty(
-                (_b12x_scratch_nbytes(plan),),
-                dtype=torch.uint8,
-                device=device,
-            )
-            _run_b12x_moe_plan(
-                plan=plan,
-                scratch=scratch,
-                hidden_states=hidden_states,
-                prepared=prepared,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                output=output,
-                unit_scale_contract=self._quant_mode == "w4a16",
-            )
+            for route_ids_dtype in (torch.int32, torch.int64):
+                scratch = torch.empty(
+                    (_b12x_scratch_nbytes(plan),),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                hidden_states = torch.zeros(
+                    (tokens, int(prepared.hidden_size)),
+                    dtype=dtype,
+                    device=device,
+                )
+                output = torch.empty_like(hidden_states)
+                topk_ids = (
+                    torch.arange(topk, device=device, dtype=route_ids_dtype)
+                    .unsqueeze(0)
+                    .expand(tokens, -1)
+                    .contiguous()
+                )
+                topk_ids.remainder_(int(prepared.num_experts))
+                topk_weights = torch.full(
+                    (tokens, topk),
+                    1.0 / topk,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                # B12X warmup launches may outlive the Python call that
+                # submits them. Retain every caller-owned input, output, and
+                # scratch tensor until device completion so the allocator
+                # cannot reuse an address while a warmup kernel references it.
+                launch_resources.append(
+                    (hidden_states, output, topk_ids, topk_weights, scratch)
+                )
+                _run_b12x_moe_plan(
+                    plan=plan,
+                    scratch=scratch,
+                    hidden_states=hidden_states,
+                    prepared=prepared,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    output=output,
+                    unit_scale_contract=self._quant_mode == "w4a16",
+                )
+        if launch_resources:
+            torch.accelerator.synchronize()
         return len(launch_tokens)
 
     def workspace_shapes(

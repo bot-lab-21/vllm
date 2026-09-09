@@ -77,12 +77,16 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "DeepseekV32MTPModel",
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
+        "DeepseekV4ForConditionalGeneration",
         "DeepSeekV4MTPModel",
         "Dots3NoteForCausalLM",
         "Dots3NoteMTPModel",
         "GlmMoeDsaForCausalLM",
         "HYV4ForCausalLM",
         "HYV4MTPModel",
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
@@ -159,7 +163,7 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable if TP > 1 and Hopper/Blackwell and flashinfer installed."""
+    """Enable when a supported fused all-reduce RMSNorm backend is active."""
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
@@ -174,14 +178,13 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
             rocm_aiter_ops.is_enabled() and cfg.parallel_config.tensor_parallel_size > 1
         )
 
-    return (
-        cfg.parallel_config.tensor_parallel_size > 1
-        and current_platform.is_cuda()
-        and has_flashinfer()
-        and (
-            current_platform.is_device_capability_family(100)
-            or current_platform.is_device_capability(90)
-        )
+    if cfg.parallel_config.tensor_parallel_size <= 1 or not current_platform.is_cuda():
+        return False
+    if envs.VLLM_ENABLE_PCIE_ALLREDUCE:
+        return envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
+    return has_flashinfer() and (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability(90)
     )
 
 
@@ -554,6 +557,60 @@ class VllmConfig:
             else None
         )
         return bool(mm_config and mm_config.mm_encoder_only)
+
+    @property
+    def use_request_boundary_checkpoints(self) -> bool:
+        """Whether this runner has a complete recurrent boundary-state adapter."""
+        from vllm.platforms import current_platform
+
+        cache = self.cache_config
+        model = self.model_config
+        parallel = self.parallel_config
+        return (
+            cache.recurrent_checkpoint_policy in ("auto", "request_boundaries")
+            and cache.enable_prefix_caching
+            and cache.mamba_cache_mode == "align"
+            and (
+                cache.kv_cache_layout is None
+                or cache.get_resolved_kv_cache_layout().is_block_outermost
+            )
+            and self.use_v2_model_runner
+            and current_platform.is_cuda()
+            and model is not None
+            and not model.enable_sleep_mode
+            and not model.enable_return_routed_experts
+            and self.lora_config is None
+            and model.hf_text_config.model_type
+            in (
+                "qwen3_8_flash_next_text",
+                "qwen3_8_flash_next",
+                "glm5_next_text",
+                "glm5_next",
+            )
+            and (
+                self.speculative_config is None
+                or (
+                    (
+                        self.speculative_config.method == "mtp"
+                        or (
+                            self.speculative_config.method == "dflash"
+                            and model.hf_text_config.model_type
+                            in ("glm5_next_text", "glm5_next")
+                        )
+                    )
+                    and not self.speculative_config.uses_dynamic_speculative_decoding()
+                )
+            )
+            and parallel.pipeline_parallel_size == 1
+            and parallel.data_parallel_size == 1
+            and (
+                parallel.decode_context_parallel_size == 1
+                or model.hf_text_config.model_type in ("glm5_next_text", "glm5_next")
+            )
+            and parallel.prefill_context_parallel_size == 1
+            and self.kv_transfer_config is None
+            and cache.kv_offloading_size is None
+        )
 
     @property
     def max_concurrent_batches(self) -> int:
@@ -955,11 +1012,13 @@ class VllmConfig:
             "Dynamic speculative decoding is not supported with data "
             "parallelism because data-parallel ranks can select different "
             "speculative-token counts, causing DP divergence and deadlocks. "
-            "Disabling num_speculative_tokens_per_batch_size and falling back "
-            "to static num_speculative_tokens=%d.",
+            "Disabling dynamic speculative decoding and falling back to "
+            "static num_speculative_tokens=%d.",
             speculative_config.num_speculative_tokens,
         )
         speculative_config.num_speculative_tokens_per_batch_size = None
+        speculative_config.adaptive_speculative_tokens_window = None
+        speculative_config.adaptive_speculative_tokens_initial = None
 
     def _post_init_kv_transfer_config(self) -> None:
         """Update KVTransferConfig based on top-level configs in VllmConfig.
@@ -1088,6 +1147,15 @@ class VllmConfig:
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
+
+        if (
+            self.scheduler_config.fairness_engine is not None
+            and self.parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError(
+                "fairness_engine does not yet support data parallelism; all DP "
+                "ranks must make one synchronized fairness decision"
+            )
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
@@ -2823,6 +2891,7 @@ class VllmConfig:
             return self
         if (
             self.cache_config.cache_dtype.startswith("nvfp4")
+            and self.cache_config.cache_dtype != "nvfp4_ds_mla"
             and self.model_config.use_mla
         ):
             raise ValueError(

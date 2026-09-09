@@ -16,6 +16,10 @@ class RecoverSSMState:
     def __init__(self) -> None:
         self._step: tuple[RecoverSSMMetadata, ...] | None = None
 
+    def reset(self) -> None:
+        """Discard metadata staged for a cache allocation that is being released."""
+        self._step = None
+
     def record_step(
         self,
         attn_metadata: dict[str, Any],

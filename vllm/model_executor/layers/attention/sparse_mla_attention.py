@@ -115,6 +115,7 @@ def _is_masked_mha_available(
 class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
     metadata_cls: type[T]
     require_uniform_decodes: ClassVar[bool] = False
+    treat_short_extends_as_decodes: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -273,7 +274,9 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold or 1,
-            treat_short_extends_as_decodes=not self.use_pcp,
+            treat_short_extends_as_decodes=(
+                self.treat_short_extends_as_decodes and not self.use_pcp
+            ),
             require_uniform=self.require_uniform_decodes,
         )
         (

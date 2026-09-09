@@ -344,6 +344,9 @@ class MambaCopySpec:
 MambaStateCopyFunc: TypeAlias = Callable[
     [torch.Tensor, list[int], int, int], MambaCopySpec
 ]
+MambaStateCopyFuncsByType: TypeAlias = dict[
+    MambaAttentionBackendEnum, tuple[MambaStateCopyFunc, ...]
+]
 """
 Type alias for a function that computes a MambaCopySpec for copying state slices.
 Parameters:

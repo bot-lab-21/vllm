@@ -126,6 +126,10 @@ class ModelState(ABC):
     def apply_staged_writes(self) -> None:
         return None
 
+    def reset_kv_cache_state(self) -> None:
+        """Release model-state objects derived from an allocated KV cache."""
+        return None
+
     def get_additional_cg_support(self) -> tuple[AttentionCGSupport, str | None]:
         """Cudagraph support of attention groups this ModelState builds outside
         ``init_attn_backend`` (e.g. encoder-only layers).
@@ -147,6 +151,14 @@ class ModelState(ABC):
         across block boundaries. No-op by default."""
         return None
 
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return persistent per-request auxiliary state for boundary caching."""
+        return ()
+
+    def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
+        """Return per-request selector acceptance for boundary MTP replay."""
+        raise NotImplementedError
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,
@@ -154,6 +166,21 @@ class ModelState(ABC):
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         return None
+
+    def prepare_draft_attn_metadata(
+        self,
+        *,
+        idx_mapping: torch.Tensor,
+        num_reqs: int,
+        num_reqs_padded: int,
+        draft_index: int,
+    ) -> ModelSpecificAttnMetadata | None:
+        """Build model-specific metadata for a draft lookahead forward."""
+        return None
+
+    def get_model_positions(self, input_batch: InputBatch) -> torch.Tensor:
+        """Return the positions prepared for the target model forward."""
+        return input_batch.positions
 
     @abstractmethod
     def prepare_inputs_embeds(

@@ -15,6 +15,7 @@ from typing import Any, NamedTuple, NewType, TypeAlias, overload
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
@@ -720,7 +721,10 @@ def resolve_kv_cache_block_sizes(
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:
-        bs = cache_config.block_size * dcp
+        dcp_replicated = len(groups) == 1 and getattr(
+            groups[0].kv_cache_spec, "dcp_replicated", False
+        )
+        bs = cache_config.block_size * (1 if dcp_replicated else dcp)
         return bs, bs
 
     group_block_sizes = [
@@ -1202,8 +1206,74 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
     return not kv_cache_spec
 
 
+def _get_kv_cache_layer_buckets(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[list[str]]:
+    """Group layers whose cache specifications can share one group.
+
+    Args:
+        kv_cache_spec: Cache specification keyed by layer name.
+
+    Returns:
+        Compatible layer-name buckets in input discovery order.
+    """
+    # Group all layers by kv_cache_spec.
+    # E.g., 2 full attention layers and 3 sliding window attention layers,
+    # -> (full.0, full.1), (sw.0, sw.1, sw.2).
+    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    for layer_name, layer_spec in kv_cache_spec.items():
+        same_type_layers[layer_spec].append(layer_name)
+
+    # Attempt to further merge same-type layers based on whether their KV
+    # cache specs can be merged, to minimize the group count. This benefits
+    # situations where specs share a block layout and differ only in a
+    # property it can reconcile (e.g. full attention layers differing only in
+    # sliding window / attention chunk size).
+    layer_buckets: list[list[str]] = []
+    spec_buckets: list[list[KVCacheSpec]] = []
+    for layer_spec, layer_names in same_type_layers.items():
+        for names, specs in zip(layer_buckets, spec_buckets):
+            try:
+                # A raise means that the specs are incompatible.
+                type(specs[0]).merge([*specs, layer_spec])
+            except (AssertionError, ValueError):
+                continue
+            names.extend(layer_names)
+            specs.append(layer_spec)
+            break
+        else:
+            layer_buckets.append(list(layer_names))
+            spec_buckets.append([layer_spec])
+    return layer_buckets
+
+
+def _split_kv_cache_layer_buckets(
+    kv_cache_spec: dict[str, KVCacheSpec],
+    layer_buckets: list[list[str]],
+    group_counts: Sequence[int],
+) -> list[KVCacheGroupSpec]:
+    """Split compatible layer buckets into round-robin cache groups.
+
+    Args:
+        kv_cache_spec: Cache specification keyed by layer name.
+        layer_buckets: Compatible layer-name buckets to split.
+        group_counts: Number of groups to create from each bucket.
+
+    Returns:
+        Cache-group specifications for the requested splits.
+    """
+    grouped_layers = [
+        layers[i::num_groups]
+        for layers, num_groups in zip(layer_buckets, group_counts)
+        for i in range(num_groups)
+    ]
+    return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+
+
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    *,
+    log_padding: bool = True,
 ) -> list[KVCacheGroupSpec]:
     """
     Generates the KV cache groups for hybrid models with multiple
@@ -1267,33 +1337,7 @@ def _get_kv_cache_groups_uniform_page_size(
     Returns:
         The generated KVCacheGroupSpecs
     """
-    # Group all layers by kv_cache_spec.
-    # E.g., 2 full attention layers and 3 sliding window attention layers,
-    # -> (full.0, full.1), (sw.0, sw.1, sw.2).
-    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
-    for layer_name, layer_spec in kv_cache_spec.items():
-        same_type_layers[layer_spec].append(layer_name)
-
-    # Attempt to further merge same-type layers based on whether their KV
-    # cache specs can be merged, to minimize the group count. This benefits
-    # situations where specs share a block layout and differ only in a
-    # property it can reconcile (e.g. full attention layers differing only in
-    # sliding window / attention chunk size).
-    layer_buckets: list[list[str]] = []
-    spec_buckets: list[list[KVCacheSpec]] = []
-    for layer_spec, layer_names in same_type_layers.items():
-        for names, specs in zip(layer_buckets, spec_buckets):
-            try:
-                # A raise means that the specs are incompatible.
-                type(specs[0]).merge([*specs, layer_spec])
-            except (AssertionError, ValueError):
-                continue
-            names.extend(layer_names)
-            specs.append(layer_spec)
-            break
-        else:
-            layer_buckets.append(list(layer_names))
-            spec_buckets.append([layer_spec])
+    layer_buckets = _get_kv_cache_layer_buckets(kv_cache_spec)
 
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
@@ -1319,10 +1363,10 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
-    grouped_layers = []
+    group_counts = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
-        if num_padding_layers != group_size:
+        if log_padding and num_padding_layers != group_size:
             logger.warning(
                 "Add %d padding layers, may waste at most %.2f%% KV cache memory",  # noqa
                 num_padding_layers,
@@ -1340,9 +1384,8 @@ def _get_kv_cache_groups_uniform_page_size(
         # the same and will cause memory waste.
         # To avoid this, we assign layers[i::num_groups] to the i-th group
         # instead of layers[i * group_size: (i + 1) * group_size]
-        for i in range(num_groups):
-            grouped_layers.append(layers[i::num_groups])
-    return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+        group_counts.append(num_groups)
+    return _split_kv_cache_layer_buckets(kv_cache_spec, layer_buckets, group_counts)
 
 
 def _get_per_layer_spec(
@@ -1353,6 +1396,14 @@ def _get_per_layer_spec(
     if isinstance(spec, UniformTypeKVCacheSpecs):
         return spec.kv_cache_specs[layer_name]
     return spec
+
+
+def _contains_glm5_next_mla(kv_cache_specs: Iterable[KVCacheSpec]) -> bool:
+    """Return whether the cache specifications contain GLM-5.3 target MLA."""
+    return any(
+        isinstance(spec, MLAAttentionSpec) and spec.model_version == "glm5_next"
+        for spec in kv_cache_specs
+    )
 
 
 def _get_kv_cache_bytes_per_block(
@@ -1367,7 +1418,155 @@ def _get_kv_cache_bytes_per_block(
         for group in kv_cache_groups
     )
     assert bytes_per_block > 0
+    contains_glm5_next_mla = _contains_glm5_next_mla(
+        _get_per_layer_spec(group, layer_name)
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    )
+    if (
+        os.getenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE") is not None
+        and contains_glm5_next_mla
+    ):
+        # GLM-5.3 stores two 64-row by 132-byte FP8 C4 index pages in the
+        # target MLA page tail when the target block contains 512 tokens.
+        # The block-outermost pool stride must preserve the index-page unit
+        # even when a larger recurrent-state group determines pool capacity.
+        glm_c4_index_page_bytes = 64 * 132
+        bytes_per_block = round_up(bytes_per_block, glm_c4_index_page_bytes)
     return bytes_per_block
+
+
+# Groups add block-table rows and connector work. This is twice GLM-5.3's
+# baseline count, enough to balance its split pages without unbounded overhead.
+_MAX_WEIGHTED_SHARED_POOL_GROUPS = 8
+
+
+def _iter_bounded_group_counts(
+    group_count_ranges: Sequence[range],
+    max_total: int,
+) -> Iterator[tuple[int, ...]]:
+    """Yield group-count combinations whose sum does not exceed a limit.
+
+    Args:
+        group_count_ranges: Ascending positive group counts for each layer bucket.
+        max_total: Maximum sum permitted across one combination.
+
+    Yields:
+        A group-count tuple whose sum is at most ``max_total``.
+    """
+
+    def visit(
+        bucket_index: int,
+        running_total: int,
+        counts: tuple[int, ...],
+    ) -> Iterator[tuple[int, ...]]:
+        if bucket_index == len(group_count_ranges):
+            yield counts
+            return
+
+        remaining_buckets = len(group_count_ranges) - bucket_index - 1
+        for group_count in group_count_ranges[bucket_index]:
+            new_total = running_total + group_count
+            if new_total + remaining_buckets > max_total:
+                break
+            yield from visit(
+                bucket_index + 1,
+                new_total,
+                (*counts, group_count),
+            )
+
+    yield from visit(0, 0, ())
+
+
+def _get_kv_cache_group_allocation_cost(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    """Calculate shared-pool bytes needed by a maximum-length request.
+
+    Args:
+        vllm_config: Serving configuration used to determine request capacity.
+        kv_cache_groups: Candidate cache groups sharing the physical pool.
+
+    Returns:
+        Required shared-pool bytes for one maximum-length request.
+    """
+    num_blocks_per_request = sum(
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+        for group in kv_cache_groups
+    )
+    return _get_kv_cache_bytes_per_block(kv_cache_groups) * num_blocks_per_request
+
+
+def _get_weighted_shared_pool_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """Balance split-page groups by their shared-pool memory cost.
+
+    Args:
+        vllm_config: Serving configuration used to evaluate candidate layouts.
+        kv_cache_spec: Cache specification keyed by layer name.
+
+    Returns:
+        Lowest-cost compatible layout within the cache-group limit.
+
+    Raises:
+        ValueError: If incompatible layer buckets cannot fit within the limit.
+    """
+    layer_buckets = _get_kv_cache_layer_buckets(kv_cache_spec)
+    if len(layer_buckets) > _MAX_WEIGHTED_SHARED_POOL_GROUPS:
+        raise ValueError(
+            "Cannot represent split KV cache within the group limit: "
+            f"{len(layer_buckets)} incompatible layer buckets require at least "
+            f"{len(layer_buckets)} groups, but the limit is "
+            f"{_MAX_WEIGHTED_SHARED_POOL_GROUPS}."
+        )
+    baseline_groups = _get_kv_cache_groups_uniform_page_size(
+        kv_cache_spec, log_padding=False
+    )
+    baseline_cost = _get_kv_cache_group_allocation_cost(vllm_config, baseline_groups)
+    baseline_within_limit = len(baseline_groups) <= _MAX_WEIGHTED_SHARED_POOL_GROUPS
+    best_groups = baseline_groups if baseline_within_limit else None
+    best_key = (baseline_cost, len(baseline_groups)) if baseline_within_limit else None
+
+    group_count_ranges = [
+        range(1, min(len(layers), _MAX_WEIGHTED_SHARED_POOL_GROUPS) + 1)
+        for layers in layer_buckets
+    ]
+    for group_counts in _iter_bounded_group_counts(
+        group_count_ranges, _MAX_WEIGHTED_SHARED_POOL_GROUPS
+    ):
+        total_groups = sum(group_counts)
+        groups = _split_kv_cache_layer_buckets(
+            kv_cache_spec, layer_buckets, group_counts
+        )
+        cost = _get_kv_cache_group_allocation_cost(vllm_config, groups)
+        candidate_key = (cost, total_groups)
+        if best_key is None or candidate_key < best_key:
+            best_key = candidate_key
+            best_groups = groups
+
+    if best_groups is None or best_key is None:
+        raise ValueError(
+            "No compatible split KV cache layout fits within the "
+            f"{_MAX_WEIGHTED_SHARED_POOL_GROUPS}-group limit."
+        )
+    if best_groups is not baseline_groups:
+        logger.warning(
+            "Rebalanced split KV cache groups from layer counts %s to %s; "
+            "shared-pool max-request cost decreased from %d to %d bytes "
+            "(%.2f%%).",
+            [len(group.layer_names) for group in baseline_groups],
+            [len(group.layer_names) for group in best_groups],
+            baseline_cost,
+            best_key[0],
+            (baseline_cost - best_key[0]) / baseline_cost * 100,
+        )
+    return best_groups
 
 
 def validate_kv_cache_layout(
@@ -1615,6 +1814,18 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     Args:
         kv_cache_spec: The kv cache spec of each attention layer in the model
     """
+
+    dcp_replication_modes = {
+        spec.dcp_replicated
+        for spec in kv_cache_spec.values()
+        if isinstance(spec, AttentionSpec)
+    }
+    if len(dcp_replication_modes) > 1:
+        raise ValueError(
+            "Hybrid KV cache manager cannot be disabled when attention layers "
+            "mix DCP-replicated and DCP-sharded KV cache specs. Remove "
+            "`--disable-hybrid-kv-cache-manager` or disable DCP."
+        )
 
     if is_kv_cache_spec_uniform(
         kv_cache_spec
@@ -1909,6 +2120,45 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
+def _partition_parallel_draft_specs(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> tuple[dict[str, KVCacheSpec], dict[str, KVCacheSpec]]:
+    """Split appended DFlash or GLM DSpark layers for PP1 cache grouping."""
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is None
+        or not (
+            speculative_config.method == "dflash"
+            or (
+                speculative_config.method == "dspark"
+                and speculative_config.draft_model_config.hf_config.model_type
+                == "glm53_dspark"
+            )
+        )
+        or vllm_config.parallel_config.pipeline_parallel_size > 1
+        or vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+    ):
+        return kv_cache_spec, {}
+
+    target_num_layers = vllm_config.model_config.get_num_layers(
+        vllm_config.parallel_config
+    )
+    target_specs: dict[str, KVCacheSpec] = {}
+    draft_specs: dict[str, KVCacheSpec] = {}
+    for layer_name, spec in kv_cache_spec.items():
+        try:
+            layer_index = extract_layer_index(layer_name)
+        except (AssertionError, IndexError, ValueError):
+            target_specs[layer_name] = spec
+            continue
+        if layer_index >= target_num_layers:
+            draft_specs[layer_name] = spec
+        else:
+            target_specs[layer_name] = spec
+    return target_specs, draft_specs
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1930,6 +2180,19 @@ def get_kv_cache_groups(
         # This returns an empty list to allow for the KVCacheManager to handle
         # attention free models.
         return []
+
+    target_specs, draft_specs = _partition_parallel_draft_specs(
+        vllm_config, kv_cache_spec
+    )
+    if target_specs and draft_specs:
+        target_groups = get_kv_cache_groups(vllm_config, target_specs)
+        draft_groups = get_kv_cache_groups(vllm_config, draft_specs)
+        logger.info(
+            "Keeping %d parallel draft KV layers in %d independent cache groups",
+            len(draft_specs),
+            len(draft_groups),
+        )
+        return [*target_groups, *draft_groups]
 
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for
@@ -2274,9 +2537,11 @@ def get_kv_cache_configs(
     # This is to prevent that some layers are initialized with unregistered specs.
     KVCacheSpecRegistry.check_kv_cache_spec_registry(merged_kv_cache_specs)
 
-    # When speculating with more than 1 speculative module (e.g. multi-layered MTP)
+    # When speculating with more than 1 speculative module (e.g. multi-layered MTP),
     # tag every SlidingWindowSpec with how many extra tokens to retain in the window.
-    extra_retained_tokens = (
+    # A model-specific cache spec may require a larger retention window (DFlash's
+    # EAGLE prefix proof is one example), so never erase that value here.
+    mtp_extra_retained_tokens = (
         vllm_config.speculative_config.num_speculative_tokens - 1
         if vllm_config.speculative_config is not None
         and vllm_config.speculative_config.use_multi_module_mtp()
@@ -2285,7 +2550,10 @@ def get_kv_cache_configs(
     for layer_name, layer_spec in merged_kv_cache_specs.items():
         if isinstance(layer_spec, SlidingWindowSpec):
             merged_kv_cache_specs[layer_name] = replace(
-                layer_spec, extra_retained_tokens=extra_retained_tokens
+                layer_spec,
+                extra_retained_tokens=max(
+                    layer_spec.extra_retained_tokens, mtp_extra_retained_tokens
+                ),
             )
 
     # Get global KV cache groups. This also handles spec unification for

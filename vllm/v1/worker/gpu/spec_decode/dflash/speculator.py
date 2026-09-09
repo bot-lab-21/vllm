@@ -183,6 +183,17 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+        draft_cp_parameters = {
+            block_tables.get_group_cp_parameters(gid)
+            for gid in self.draft_kv_cache_group_ids
+        }
+        if len(draft_cp_parameters) != 1:
+            raise NotImplementedError(
+                "DFlash draft attention groups must use one DCP layout."
+            )
+        self.draft_cp_rank, self.draft_cp_size, self.draft_cp_interleave = (
+            draft_cp_parameters.pop()
+        )
 
         # Per-group context slot buffers for the precompute (one row per group).
         self._context_slot_mappings = torch.zeros(
@@ -216,6 +227,22 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
+
+    def reset_attn(self) -> None:
+        """Release DFlash state derived from the target KV-cache layout."""
+        for name in (
+            "draft_kv_cache_group_ids",
+            "draft_kv_cache_group_id",
+            "draft_cp_rank",
+            "draft_cp_size",
+            "draft_cp_interleave",
+            "_context_slot_mappings",
+            "_layer_group_idx",
+            "_group_causal",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
+        super().reset_attn()
 
     @torch.inference_mode()
     def _run_model(
@@ -326,11 +353,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         # [max_num_reqs]
         seeds: torch.Tensor,
         dp_sync: DPSyncState | None = None,
+        num_speculative_tokens: int | None = None,
+        num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        context_kv_is_restored: bool = False,
     ) -> torch.Tensor:
+        del num_speculative_tokens
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
@@ -343,13 +374,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+        if not context_kv_is_restored:
+            if aux_hidden_states:
+                hidden_states = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
+            else:
+                hidden_states = last_hidden_states
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
             )
-        else:
-            hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -379,6 +413,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         assert self.draft_kv_cache_group_id >= 0
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            cp_rank, cp_size, cp_interleave = self.block_tables.get_group_cp_parameters(
+                gid
+            )
             prepare_dflash_inputs(
                 self.input_buffers,
                 self.block_tables.slot_mappings[gid],
@@ -398,9 +435,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 seeds,
                 self.block_tables.input_block_tables[gid],
                 self.block_tables.kernel_block_sizes[gid],
-                self.block_tables.cp_rank,
-                self.block_tables.cp_size,
-                self.block_tables.cp_interleave,
+                cp_rank,
+                cp_size,
+                cp_interleave,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
                 self.num_speculative_steps,
@@ -423,11 +460,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
-        )
+        if not context_kv_is_restored:
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, batch_sync = dispatch_cg_and_sync_dp(

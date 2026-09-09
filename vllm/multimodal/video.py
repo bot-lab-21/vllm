@@ -665,6 +665,34 @@ class GLM46VVideoBackend(VideoBackend):
 
 
 @VIDEO_LOADER_REGISTRY.register(
+    "glm5next",
+    video_processor=("Glm5NextVideoProcessor", "Glm5nextVideoProcessor"),
+)
+class Glm5NextVideoBackend(VideoBackend):
+    """GLM-5.3-Flash fps-interval video backend."""
+
+    @classmethod
+    def compute_frames_index_to_sample(
+        cls,
+        source: VideoSourceMetadata,
+        target: VideoTargetMetadata,
+        **kwargs,
+    ) -> list[int]:
+        from vllm.transformers_utils.processors.glm5next import (
+            glm_sample_frame_indices,
+        )
+
+        return glm_sample_frame_indices(
+            source.total_frames_num,
+            source.original_fps,
+            source.duration or 0,
+            target_fps=target.fps if target.fps > 0 else None,
+            max_frame_count=kwargs.get("max_frames"),
+            temporal_patch_size=kwargs.get("temporal_patch_size", 2),
+        )
+
+
+@VIDEO_LOADER_REGISTRY.register(
     "glmga",
     video_processor="GlmgaVideoProcessor",
 )

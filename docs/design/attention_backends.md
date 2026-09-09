@@ -136,6 +136,19 @@ Priority is **1 = highest** (tried first).
 > `--block-size` that is not a multiple of 128 instead makes FlashAttention ineligible
 > for such models, which is an error if the backend was requested explicitly.
 
+### b12x
+
+The optional [b12x](https://pypi.org/project/b12x/) backend supports causal
+decoder attention and compatible sparse MLA models on NVIDIA SM120 and SM121
+GPUs. The `B12X` selector chooses the implementation for the model's attention
+contract, including non-compressed DSA models and DeepSeek V4's compressed
+sparse MLA path. Install and select it with:
+
+```bash
+uv pip install "vllm[b12x]"
+vllm serve <model> --attention-backend b12x
+```
+
 ## MiniMax M3 Sparse Attention Backends
 
 Block-sparse GQA backend used by MiniMax M3 sparse ("lightning indexer")
@@ -180,5 +193,7 @@ DeepSeek V4 sparse MLA uses its own decode backends, selected via
 pipeline (compressor + SWA + indexer, 256-token blocks, head 512);
 default on NVIDIA is `FLASHINFER_MLA_SPARSE_DSV4` on SM12x and
 `FLASHMLA_SPARSE_DSV4` on other supported CUDA architectures.
+On SM120 and SM121, `B12X` selects the optional `b12x` DSA indexer, compressed
+sparse MLA, fused output projection, and mHC residual kernels.
 
 --8<-- "gen:table-mla-v4-decode"

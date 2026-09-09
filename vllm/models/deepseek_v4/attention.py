@@ -45,6 +45,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.triton_utils import tl, triton
@@ -127,13 +128,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ``get_padded_num_q_heads`` / ``_o_proj`` / ``backend_cls``) is provided by a
     subclass — ``DeepseekV4FlashMLAAttention`` /
     ``DeepseekV4FlashInferSM120Attention`` /
-    ``DeepseekV4FlashInferMLAAttention`` (CUDA) or
+    ``DeepseekV4FlashInferMLAAttention`` / ``DeepseekV4B12xAttention`` (CUDA) or
     ``DeepseekV4ROCMAiterMLAAttention`` (ROCm) — selected by the platform-specific
     deepseek_v4 model module. The base is never instantiated directly.
     """
 
     # Provided by the platform subclass.
     backend_cls: ClassVar[type[AttentionBackend]]
+    indexer_backend_cls: ClassVar[type[AttentionBackend]] = cast(
+        type[AttentionBackend], DeepseekV4IndexerBackend
+    )
+    indexer_op_cls: ClassVar[type[nn.Module]] = SparseAttnIndexer
     # Backend for the SWA cache layer; None uses the default SWA backend.
     swa_backend_cls: ClassVar[type[AttentionBackend] | None] = None
     # KV-cache per-token block format (both layouts are paged). True (default)
@@ -205,6 +210,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
+        # Vision variant: image spans are visible bidirectionally, widening
+        # prefill SWA index rows by up to max_image_tokens columns.
+        self.max_image_tokens = (
+            getattr(config, "vision_max_n_token", 0)
+            if getattr(config, "vision_n_layers", 0) > 0
+            else 0
+        )
         # NOTE(zyongye) Compress ratio can't be 0
         # we do this for because MTP layer is not included
         # in the compress ratio list
@@ -220,7 +232,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Sink padded to the same head count, initialized to -inf (no sink
         # effect). Weight loading fills the first n_local_heads slots.
         self.attn_sink = nn.Parameter(
-            torch.full((self.padded_heads,), -float("inf"), dtype=torch.float32),
+            allocate_weights(
+                torch.full, (self.padded_heads,), -float("inf"), dtype=torch.float32
+            ),
             requires_grad=False,
         )
 
@@ -293,6 +307,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 compress_ratio=self.compress_ratio,
                 prefix=f"{prefix}.indexer",
                 aux_stream=indexer_aux_stream,
+                backend_cls=self.indexer_backend_cls,
+                indexer_op_cls=self.indexer_op_cls,
             )
 
         self._prepare_and_attn_fn = self._prepare_and_attn
@@ -762,6 +778,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         prefix: str,
         cache_config: CacheConfig,
         compress_ratio: int = 1,
+        backend_cls: type[AttentionBackend] = DeepseekV4IndexerBackend,
     ):
         super().__init__()
         self.kv_cache = torch.tensor([])
@@ -770,6 +787,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.cache_config = cache_config
         self.dtype = dtype
         self.compress_ratio = compress_ratio
+        self.backend_cls = backend_cls
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -796,7 +814,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return DeepseekV4IndexerBackend
+        return self.backend_cls
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -812,6 +830,8 @@ class DeepseekV4Indexer(nn.Module):
         compress_ratio: int = 1,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
+        backend_cls: type[AttentionBackend] = DeepseekV4IndexerBackend,
+        indexer_op_cls: type[nn.Module] = SparseAttnIndexer,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -877,6 +897,7 @@ class DeepseekV4Indexer(nn.Module):
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
             compress_ratio=self.compress_ratio,
+            backend_cls=backend_cls,
         )
         self.compressor = DeepseekCompressor(
             vllm_config=vllm_config,
@@ -889,7 +910,7 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4_cache=self.use_fp4_kv,
         )
 
-        self.indexer_op = SparseAttnIndexer(
+        self.indexer_op = indexer_op_cls(
             self.k_cache,
             self.quant_block_size,
             self.scale_fmt,

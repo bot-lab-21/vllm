@@ -151,11 +151,14 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
         # [max_num_reqs]
         seeds: torch.Tensor,
         dp_sync: DPSyncState | None = None,
+        num_speculative_tokens: int | None = None,
+        num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        del num_speculative_tokens
         num_reqs = input_batch.num_reqs
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
