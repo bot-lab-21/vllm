@@ -75,6 +75,20 @@ class Glm5vConfig(PretrainedConfig):
         elif outer_quantization_config is not None:
             self.quantization_config = outer_quantization_config
 
+    def __getattr__(self, name: str):
+        """Delegate unknown attributes to the text config.
+
+        The V2 speculator (and other target-config consumers) read MoE/attention fields such as
+        ``n_group``, ``num_experts`` or ``kv_lora_rank`` from the *target* ``hf_config``; for the
+        vision wrapper those live on ``text_config``. Only reached when normal lookup fails.
+        """
+        if name.startswith("_") or name in ("text_config", "vision_config"):
+            raise AttributeError(name)
+        text_config = self.__dict__.get("text_config")
+        if text_config is not None and hasattr(text_config, name):
+            return getattr(text_config, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
     @property
     def hidden_size(self) -> int:
         return self.text_config.hidden_size
