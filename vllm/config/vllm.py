@@ -82,6 +82,7 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "Dots3NoteForCausalLM",
         "Dots3NoteMTPModel",
         "GlmMoeDsaForCausalLM",
+        "Glm5vForConditionalGeneration",
         "HYV4ForCausalLM",
         "HYV4MTPModel",
         "Glm5NextForCausalLM",

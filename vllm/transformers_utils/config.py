@@ -93,6 +93,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     glm53_dspark="Glm53DSparkConfig",
     glm5_next_text="Glm5NextTextConfig",
     glm5_next_vision="Glm5NextVisionConfig",
+    glm5v="Glm5vConfig",
     hyperclovax="HyperCLOVAXConfig",
     hy_v3="HYV3Config",
     hy_v4="HYV4Config",
