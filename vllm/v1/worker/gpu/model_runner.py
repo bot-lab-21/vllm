@@ -569,9 +569,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         block_sizes = []
         max_num_blocks_per_group = []
         group_cp_sizes = []
+        slot_mapping_enabled = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
+            layer_spec = (
+                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            )
+            slot_mapping_enabled.append(not isinstance(layer_spec, CircularBufferSpec))
             group_cp_sizes.append(
                 1 if getattr(spec, "dcp_replicated", False) else self.dcp_size
             )
