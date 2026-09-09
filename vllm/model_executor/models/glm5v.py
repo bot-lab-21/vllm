@@ -209,6 +209,13 @@ class Glm5vForConditionalGeneration(KimiK25ForConditionalGeneration):
         )
         self.media_placeholder = config.media_placeholder_token_id
 
+        # The V2 runner treats the *presence* of get_mtp_target_hidden_states as a
+        # promise of a tensor (it slices the result). Only expose it when the text
+        # model actually provides the hook (DeepSeek-V4 does, GlmMoeDsa does not).
+        fn = getattr(self.language_model, "get_mtp_target_hidden_states", None)
+        if fn is not None:
+            self.get_mtp_target_hidden_states = fn
+
     # ---- V2 model-runner / MTP hooks: delegate to the text model when present ----
 
     def compute_logits_local(self, hidden_states):
@@ -219,11 +226,6 @@ class Glm5vForConditionalGeneration(KimiK25ForConditionalGeneration):
 
     def get_expert_mapping(self):
         return self.language_model.get_expert_mapping()
-
-    def get_mtp_target_hidden_states(self):
-        """Pre-final-norm residual stream buffer for the MTP draft model."""
-        fn = getattr(self.language_model, "get_mtp_target_hidden_states", None)
-        return None if fn is None else fn()
 
     def process_weights_after_loading(self) -> None:
         fn = getattr(self.language_model, "process_weights_after_loading", None)
